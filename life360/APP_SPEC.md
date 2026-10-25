@@ -275,7 +275,7 @@ fetchLocations():
   if circle unset OR no members selected: return false
   if rateLimitedUntilMs in future: return false       # honor prior 429
   if tokenLikelyExpired: return false                  # don't hammer a dead token
-  ctx = buildPlacesContext()                           # serialize places ONCE per tick (§4.5)
+  ctx = buildPlacesContext()                           # resolve the selected home place ONCE per tick (§4.5)
   ctx.cookies      = state["cookies"]
   ctx.showNames    = showNamesInLogs()
   ctx.showMapsLink = settings.logShowMapsLink != false
@@ -322,10 +322,13 @@ Notes:
   trust the result. A stationary member returns `304` (no body, no work). The etag header is read
   **case-insensitively** (`response.headers?.find { it.key?.equalsIgnoreCase("l360-etag") }?.value`)
   because the async headers Map is case-sensitive while HTTP header names are not.
-- **`buildPlacesContext()` once per tick.** Serialize `placesJson` a single time (it's identical for
-  every member) and thread it through every `fetchMemberLocation` → `notifyChildDevice` (§4.5).
+- **`buildPlacesContext()` once per tick.** Resolve the selected `home` place a single time (it's identical for
+  every member) and thread it through every `fetchMemberLocation` → `notifyChildDevice` (§4.5). The
+  driver only uses `home`, so the full places list is no longer serialized or passed.
 - **`markFetchSuccess(memberId)`** clears `failCount`, `tokenLikelyExpired`, `rateLimitedUntilMs`,
-  `message`, `watchdogWarned`, `lastSuccessMs`, and that member's transient backoff state.
+  `message`, `watchdogWarned`, `lastSuccessMs`, and that member's transient backoff state. Each write is
+  skipped when it would change nothing (state writes are costly on Hubitat); `lastSuccessMs` is refreshed at
+  most once a minute, far below the watchdog's 10-minute floor.
 
 ### 4.2 Membership refresh — the slow loop
 
@@ -345,7 +348,8 @@ handleCirclesPollResponse(response):
   state.memberCount = newCount
   countChanged = (prevCount != null && newCount != prevCount)
   if countChanged OR state.members empty: fetchMembers()
-  log.info("heartbeat - ${circleName}: memberCount:${newCount}${delta} ${memberStatusSummary()}")
+  if logHeartbeat:                                  # setting, default off
+      log.info("heartbeat - ${circleName}: memberCount:${displayCount}${delta} ${memberStatusSummary()}")
 
 fetchMembers():                                   # async GET /circles/{id}/members (v3)
   asynchttpGet("handleMembersResponse", life360Params("/circles/${circle}/members"))
@@ -362,11 +366,12 @@ handleMembersResponse(response):
       if m?.location: notifyChildDevice(memberId, m)
 ```
 
-**Heartbeat log.** `handleCirclesPollResponse` fires a `log.info("heartbeat - ...")` on **every**
-successful poll — not just when the count changes. It shows `memberCount`, any delta (`3 → 4`), and
-`memberStatusSummary()`: a per-member `name:connected/disconnected` string derived from each
-member's `issues.disconnected` flag in `state.members`. This proves polling is alive without
-requiring debug logging.
+**Heartbeat log.** `handleCirclesPollResponse` logs `log.info("heartbeat - ...")` on every successful poll
+only when the `logHeartbeat` setting is on (default off — it is 1,440 lines/day at the 1-minute default).
+It shows `memberCount`, any delta (`3 → 4`), and `memberStatusSummary()`: a per-member
+`name:connected/disconnected` string derived from each member's `issues.disconnected` flag in
+`state.members` (refreshed only on a count change or the Fetch Members button, so it can be stale).
+Turn it on to prove polling is alive without debug logging; the watchdog is the dead-poll signal either way.
 
 This is the integration's membership auto-sync: when the circle's member count changes, the roster is
 re-fetched, devices are reconciled, and existing devices get refreshed identity/location — without the
@@ -479,9 +484,8 @@ scheduleSlowTimer():
 - `pollFreqSecs()` and `dynamicPollFreqSecs()` read `(settings.pollFreq ?: "60")` etc. null-safely
   so a fresh install before the first **Done** can't NPE.
 - Re-arm on hub reboot via `subscribe(location, 'systemStart', initialize)`. `initialize()` calls
-  `clearSessionCache()` first — in-flight keys from requests in progress at reboot are never cleaned
-  up by their callbacks, so clearing them on restart prevents members from being permanently stuck
-  in the "prior request pending" guard.
+  `clearSessionCache()` first. In-flight markers are in memory (`INFLIGHT`), so a reboot already clears
+  them and a lost callback can never leave a member permanently stuck in the "prior request pending" guard.
 
 ---
 
@@ -508,8 +512,9 @@ members (an auth failure or 429 affects every member).
   — a flaky single member backs off without penalizing the healthy ones.
 - Any `200`/`304` for that member clears both keys (via `markFetchSuccess`).
 
-**Per-member in-flight guard.** `inflight-<id>` is set before `asynchttpGet` and cleared first thing in
-the callback; `fetchMemberLocation` skips a member whose prior request is still outstanding
+**Per-member in-flight guard.** The `INFLIGHT` static map (key `inflightKey(id)` = `"<app.id>-<id>"`, a real
+String — a GString key never matches) is set before `asynchttpGet` and cleared first thing in
+the callback; it is memory-only, not `state`; `fetchMemberLocation` skips a member whose prior request is still outstanding
 (`now - inflight[id] < (httpTimeout + 2)s`). Prevents pile-up when Life360 is slow.
 
 **Account-level token recovery.** While `tokenLikelyExpired`, the loop runs at 300s and each tick fires
@@ -535,8 +540,8 @@ banner; both clear on the next success.
 / `sendTokenExpiryReminder()` implement an optional repeat (Never/2/6/12/24/48h), self-rescheduling
 while `tokenLikelyExpired` stays true; the chain is cancelled in `updated()` and on auto-recovery.
 
-**`clearSessionCache()`** removes `cookies` and all per-member `etag-*`, `inflight-*`,
-`transientCount-*`, `transientUntilMs-*` keys (the `MEMBER_STATE_PREFIXES_SESSION` list) — a clean
+**`clearSessionCache()`** removes `cookies` and all per-member `etag-*`,
+`transientCount-*`, `transientUntilMs-*` keys (the `MEMBER_STATE_PREFIXES_SESSION` list) and this app's `INFLIGHT` entries — a clean
 slate on auth failure. Identity keys (`inTransit-*`, `fastChain-*`) survive so transit state and
 chain markers aren't lost on a mere token re-paste.
 
@@ -582,8 +587,11 @@ one-shot `forceUpdateStatus` pattern. The status dropdown resets after firing
 ## 7. Driver (child device)
 
 The driver is the stable part; nearly all change is app-side. Entry point:
-`generatePresenceEvent(member, placesJson, home, ctx)` → returns a boolean `inTransit` the app reads.
+`generatePresenceEvent(member, places, home, ctx)` (`places` is always `null` now; the driver ignores it) → returns a boolean `inTransit` the app reads.
 
+- Attributes go through `sendChanged()`, which skips `sendEvent` when the value equals the last one sent
+  (`LAST_SENT`, memory-only, keyed by `device.id`; cleared by `arrived()`, `departed()`, `updated()`). The first
+  poll after a reboot or code save resends everything. Do not "restore" unconditional `sendEvent` calls.
 - Null-safe: returns `false` early if `member` or `member.location` is null, or if `home` is null
   (a stale `settings.place` whose Life360 place was removed) — with a `log.error`, never an NPE.
 - Null-safe `since` (`location.since?.toLong() ?: 0L`).
@@ -646,7 +654,7 @@ missing place/address ⇒ `"No Data"`. `status` is `"At Home"` or `"<x.x> miles 
 the next poll — intentional. `sendHistory`/`sendTheMap` are called by the external "Life360 Tracker"
 app.)
 
-**App ↔ driver bridge (frozen):** parent calls `childDevice.generatePresenceEvent(member, placesJson,
+**App ↔ driver bridge (frozen):** parent calls `childDevice.generatePresenceEvent(member, null,
 home, ctx)` and reads its boolean return. Parent helpers the driver calls: `getShowNamesInLogs`,
 `getShowMapsLink`, `getLogRawPayload`, `getUnitIsMiles`, `refresh`. Keeping these
 stable lets a new app drive an old installed driver (and vice-versa) during a staged update.
@@ -692,7 +700,7 @@ See [STATE_REFERENCE.md](STATE_REFERENCE.md) for the authoritative per-variable 
 - **Account preference:** `unitOfMeasure` (`"i"`/`"m"`, via `GET /users/me`; drives
   `getUnitIsMiles()` which all drivers read via `ctx.useMiles`).
 - **Session:** `cookies`.
-- **Per-member (session-scoped — cleared by `clearSessionCache()`):** `etag-<id>`, `inflight-<id>`,
+- **Per-member (session-scoped — cleared by `clearSessionCache()`):** `etag-<id>`,
   `transientCount-<id>`, `transientUntilMs-<id>`. Defined in `MEMBER_STATE_PREFIXES_SESSION`.
 - **Per-member (identity-scoped — survive re-auth):** `inTransit-<id>`, `fastChain-<id>`. Defined
   in `MEMBER_STATE_PREFIXES_IDENTITY`. Cleaned up by `cleanupMemberState()` when a member is
@@ -704,7 +712,8 @@ See [STATE_REFERENCE.md](STATE_REFERENCE.md) for the authoritative per-variable 
 
 **Obsolete keys** removed by `removeObsoleteStateKeys()` on every `updated()`/`initialize()`:
 `placesJson`, `cachedHome`, `scheduledBaseSecs`, `pollIntervalSecs`, `dynamicPollingActive`,
-`memberInTransit`, `lastCirclesFetchMs`. Do not re-introduce them.
+`memberInTransit`, `lastCirclesFetchMs`, and any `inflight-<id>` keys (in-flight markers now live in the
+`INFLIGHT` map). Do not re-introduce them.
 
 No client-invented throttle state (e.g. a `lastUpdateMs` "minimum interval" guard) and no dead
 generated identifiers — the cron owns the rate, and the wire path carries no client-generated id.
@@ -798,8 +807,8 @@ To rebuild from nothing, in dependency order:
 5. **Per-member backoff + account gates (§5).** Verify a flaky member backs off alone; 401/429 pause
    the whole loop; auto-recovery probe clears `tokenLikelyExpired` on a 200.
 6. **Slow loop (§4.2):** circles poll (v4, ≤1/min) → `memberCount` diff → `fetchMembers` →
-   `handleMembersResponse` → `syncChildDevices` + name/avatar/location push. Confirm heartbeat log
-   fires every tick.
+   `handleMembersResponse` → `syncChildDevices` + name/avatar/location push. Confirm the heartbeat log
+   fires every tick with `logHeartbeat` on and is silent with it off.
 7. **Dynamic polling fast chains (§4.3):** `ensureFastChain` / `fastPollMember` / `scheduleSlowTimer`
    chain cleanup. Verify a stopped member's chain ends and the slow poll picks it back up.
 8. **Force-update (§6)** — manual button.

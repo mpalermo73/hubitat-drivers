@@ -85,7 +85,6 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 | ----------------------------- | --------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `cookies`                     | String          | `captureCookies` / `captureCookiesAsync` (via `mergeCookie`)                                         | `clearSessionCache()` (auth errors)                    | `Cookie` header value (`__cf_bm` + `_cfuvid`) sent on subsequent requests. Merged by name so a rotating `__cf_bm` never drops `_cfuvid` |
 | `etag-<memberId>`             | String          | `handleMemberLocationResponse` on 200 OK                                                             | `clearSessionCache()`                                  | Per-member `If-None-Match` value for 304-not-modified responses                                                                         |
-| `inflight-<memberId>`         | Long (epoch ms) | `fetchMemberLocation` before `asynchttpGet`                                                          | `handleMemberLocationResponse` / `clearSessionCache()` | In-flight marker; prevents async-HTTP pile-up                                                                                           |
 | `transientCount-<memberId>`   | Integer         | `handleMemberLocationResponse` on 5xx (502/503/504/520/522/525) or a network-level error (no status) | 200/304 success, `clearSessionCache()`                 | Consecutive-transient-error streak; drives exponential backoff (shift exponent capped at 6 to avoid `long` overflow)                    |
 | `transientUntilMs-<memberId>` | Long (epoch ms) | `handleMemberLocationResponse` on 5xx or network error                                               | 200/304 success, `clearSessionCache()`                 | Skip this member's fetch until this time (capped 300s backoff)                                                                          |
 
@@ -142,7 +141,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 
 | Source               | Event         | Handler                                                                                                                   |
 | -------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `location` (Hubitat) | `systemStart` | `initialize` — calls `clearSessionCache()` (clears in-flight keys left from before the restart) then re-schedules polling |
+| `location` (Hubitat) | `systemStart` | `initialize` — calls `clearSessionCache()` (drops session caches left from before the restart; in-flight markers live in memory and are already gone) then re-schedules polling |
 
 ---
 
@@ -171,7 +170,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 
 ## Driver: Attributes (per child device)
 
-Set via `sendEvent` from `generatePresenceEvent`. Read via `device.currentValue("<name>")` or in Rule Machine.
+Set from `generatePresenceEvent`, mostly via `sendChanged` (sends only when the value changed). Read via `device.currentValue("<name>")` or in Rule Machine.
 
 ### Capabilities (standard Hubitat)
 
@@ -208,7 +207,7 @@ Set via `sendEvent` from `generatePresenceEvent`. Read via `device.currentValue(
 | `inTransit`    | enum `true`/`false` | From Life360, optionally overridden by `transitThreshold`                                                                                                                                               |
 | `isDriving`    | enum `true`/`false` | From Life360, optionally overridden by `drivingThreshold`                                                                                                                                               |
 | `speed`        | number              | Current speed in user units (mph/kph)                                                                                                                                                                   |
-| `userActivity` | string              | Life360 activity hint (`unknown`/`biking`/`running`/`vehicle`); the `os_` prefix is stripped. Emitted every poll, but the value is only meaningful when the API payload includes it (often blank on V3) |
+| `userActivity` | string              | Life360 activity hint (`unknown`/`biking`/`running`/`vehicle`); the `os_` prefix is stripped. Emitted when changed, but the value is only meaningful when the API payload includes it (often blank on V3) |
 
 ### Phone / connectivity
 

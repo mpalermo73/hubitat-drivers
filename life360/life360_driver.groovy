@@ -24,6 +24,7 @@ import groovy.transform.Field
 @Field static final double MS_TO_MPH               = 2.23694  // m/s → miles per hour
 @Field static final double MS_TO_KPH               = 3.6      // m/s → kilometres per hour
 @Field static final double KM_PER_MI               = 1.609344 // kilometres per mile (divisor for km→mi)
+@Field static final Map LAST_SENT = new java.util.concurrent.ConcurrentHashMap()  // device.id -> [attr: last value sent]; memory-only, so first poll after reload resends everything
 @Field static final double EARTH_RADIUS_KM         = 6372.8   // mean Earth radius in km (used in haversine)
 
 metadata {
@@ -131,10 +132,12 @@ preferences {
 
 // -- presence sensor commands --
 def arrived() {
+    LAST_SENT.remove(device.id as String)  // manual override: let the next poll resend
     sendEvent(name: "presence", value: "present")
 }
 
 def departed() {
+    LAST_SENT.remove(device.id as String)
     sendEvent(name: "presence", value: "not present")
 }
 
@@ -159,6 +162,7 @@ def installed() {
 
 def updated() {
     log.info "updated: Location Tracker User Driver has been Updated"
+    LAST_SENT.remove(device.id as String)  // unit/threshold prefs may change derived values
     // one-time migration: isMiles bool → unitOverride enum (isMiles removed in 5.2.0)
     if (settings.unitOverride == null || settings.unitOverride == "life360") {
         def oldIsMiles = settings.isMiles
@@ -172,7 +176,7 @@ def updated() {
 
 // called from Life360+ app
 // @param member - Life360 member object (user details)
-// @param thePlaces - pre-serialized JSON of all Life360 places (string); a raw Map is still accepted for backward compat
+// @param thePlaces - unused; the app passes null. Kept only so the app<->driver signature stays stable.
 // @param home - Life360 circle which user selected as 'home'
 // @param ctx - optional poll-cycle context map (showNames, showMapsLink, useMiles) hoisted by the app once per tick
 //
@@ -275,12 +279,12 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
 
     // *** Presence ***
     String descriptionText = device.displayName + " has " + ((memberPresence == "present") ? "arrived" : "left")
-    sendEvent(name: "presence", value: memberPresence, descriptionText: descriptionText)
+    sendChanged("presence", memberPresence, descriptionText)
 
     // *** Coordinates ***
-    sendEvent(name: "longitude", value: longitude)
-    sendEvent(name: "latitude", value: latitude)
-    sendEvent(name: "accuracy", value: accuracy)
+    sendChanged("longitude", longitude)
+    sendChanged("latitude", latitude)
+    sendChanged("accuracy", accuracy)
 
     // *** Location History (only when lat/lng actually changed) ***
     if (saveHistory && (prevLatitude == null || prevLatitude != latitude
@@ -357,37 +361,37 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
         log.debug "generatePresenceEvent: $sStatus, speedUnits:$speedUnits, transitThreshold:$transitThreshold, inTransit:$inTransit, drivingThreshold:$drivingThreshold, isDriving:$isDriving"
     }
 
-    sendEvent(name: "status", value: sStatus)
+    sendChanged("status", sStatus)
 
-    sendEvent(name: "inTransit", value: inTransit.toString())
-    sendEvent(name: "isDriving", value: isDriving.toString())
-    sendEvent(name: "speed", value: speedUnits)
-    sendEvent(name: "distance", value: distanceUnits)
-    sendEvent(name: "userActivity", value: userActivity)
+    sendChanged("inTransit", inTransit.toString())
+    sendChanged("isDriving", isDriving.toString())
+    sendChanged("speed", speedUnits)
+    sendChanged("distance", distanceUnits)
+    sendChanged("userActivity", userActivity)
 
     // Set acceleration to active state if we are either moving or if we are anywhere outside home radius
     // REPURPOSED CAPABILITY (§5.4): 'acceleration' active/inactive = in transit OR driving OR away from home (NOT physical acceleration)
-    sendEvent(name: "acceleration", value: (inTransit || isDriving || memberPresence == "not present") ? "active" : "inactive")
+    sendChanged("acceleration", (inTransit || isDriving || memberPresence == "not present") ? "active" : "inactive")
 
     // *** Battery Level ***
-    sendEvent(name: "battery", value: battery)
+    sendChanged("battery", battery)
 
     // *** Charging State ***
     String powerSource = charge ? "dc" : "battery"   // canonical Power Source capability enum values
     String powerSourceDisplay = charge ? "DC" : "BTRY"  // abbreviated form used in tile display only
-    sendEvent(name: "charge", value: charge.toString())
-    sendEvent(name: "powerSource", value: powerSource)
+    sendChanged("charge", charge.toString())
+    sendChanged("powerSource", powerSource)
     // REPURPOSED CAPABILITY (§5.4): 'contact' open/closed = charging / on battery (NOT a contact sensor)
-    sendEvent(name: "contact", value: charge ? "open" : "closed")
+    sendChanged("contact", charge ? "open" : "closed")
 
     // *** Wifi ***
-    sendEvent(name: "wifiState", value: wifiState.toString())
+    sendChanged("wifiState", wifiState.toString())
     // REPURPOSED CAPABILITY (§5.4): 'switch' on/off = WiFi connected / not (NOT a controllable switch)
-    sendEvent(name: "switch", value: wifiState ? "on" : "off")
+    sendChanged("switch", wifiState ? "on" : "off")
 
     // ** Member Features **
     if (member.features != null) {
-        sendEvent(name: "shareLocation", value: toBool(member.features.shareLocation).toString())
+        sendChanged("shareLocation", toBool(member.features.shareLocation).toString())
     }
 
     // ** Member Communications **
@@ -395,9 +399,9 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
         member.communications.each { comm ->
             String commType = comm.get('channel')
             if (commType == "Voice") {
-                if (comm.value != device.currentValue("phone")) sendEvent(name: "phone", value: comm.value)
+                if (comm.value != device.currentValue("phone")) sendChanged("phone", comm.value)
             } else if (commType == "Email") {
-                if (comm.value != device.currentValue("email")) sendEvent(name: "email", value: comm.value)
+                if (comm.value != device.currentValue("email")) sendChanged("email", comm.value)
             }
         }
     }
@@ -444,6 +448,18 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     if (tileDevice1Count > HUBITAT_TILE_MAX_CHARS) log.warn "generatePresenceEvent: Too many characters to display on Dashboard (${tileDevice1Count})"
     sendEvent(name: "html", value: tileMap, displayed: true)
     return inTransit
+}
+
+/**
+ * sendEvent only when the value differs from the last one sent for this device.
+ */
+private void sendChanged(String name, value, String descriptionText = null) {
+    Map last = LAST_SENT[device.id as String]
+    if (last == null) { last = new java.util.concurrent.ConcurrentHashMap(); LAST_SENT[device.id as String] = last }
+    if (value != null && last[name] == value) return
+    if (value == null) last.remove(name) else last[name] = value
+    if (descriptionText) sendEvent(name: name, value: value, descriptionText: descriptionText)
+    else sendEvent(name: name, value: value)
 }
 
 /**

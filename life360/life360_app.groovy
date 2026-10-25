@@ -1,6 +1,10 @@
 import java.net.http.HttpTimeoutException
 import java.net.SocketTimeoutException
 import groovy.transform.Field
+import java.util.concurrent.ConcurrentHashMap
+
+// In-flight request markers, keyed "<appId>-<memberId>" (use inflightKey()). Memory-only: a hub reboot clears them, so a lost callback can never leave a member stuck.
+@Field static final ConcurrentHashMap INFLIGHT = new ConcurrentHashMap()
 
 @Field static final int    TOKEN_EXPIRED_POLL_SECS         = 300   // slow-poll rate when token is flagged expired
 @Field static final int    AUTH_FAIL_THRESHOLD             = 3     // consecutive 401/403s before flagging token expired
@@ -20,7 +24,7 @@ import groovy.transform.Field
 // Per-member state key prefixes, by scope. SESSION keys are session-bound and dropped on
 // auth failure (clearSessionCache); IDENTITY keys outlive a re-auth. Removing a member drops
 // both (cleanupMemberState). Single source of truth so the two cleanup paths can't drift.
-@Field static final List<String> MEMBER_STATE_PREFIXES_SESSION  = ["etag-", "inflight-", "transientCount-", "transientUntilMs-"]
+@Field static final List<String> MEMBER_STATE_PREFIXES_SESSION  = ["etag-", "transientCount-", "transientUntilMs-"]
 @Field static final List<String> MEMBER_STATE_PREFIXES_IDENTITY = ["inTransit-", "fastChain-"]
 
 // 5xx statuses that are a permanent server-side "no" rather than a blip worth retrying. Every
@@ -171,6 +175,8 @@ def mainPage() {
             input(name: "logRawPayload", type: "bool", defaultValue: false, submitOnChange: true, title: "Log Raw API Diagnostics", description: "Verbose. Logs sensitive data (GPS, partial token, cookies, payloads). Debug only — don't share resulting logs.")
             input(name: "logShowNames", type: "bool", defaultValue: true, submitOnChange: true, title: "Include Names and Places in Logs", description: "When on, logs show member/place/circle names. Turn off for privacy (UUIDs only) — useful when sharing logs for debugging.")
             input(name: "logShowMapsLink", type: "bool", defaultValue: true, submitOnChange: true, title: "Include Google Maps Link in Logs", description: "When a member moves, include a clickable Google Maps link to their coordinates in the info log. Turn off to keep coordinates out of logs.")
+            input(name: "logHeartbeat", type: "bool", defaultValue: false, submitOnChange: true, title: "Heartbeat Logging")
+            paragraph "<small style='color:#666'>On: A heartbeat line is logged on every poll (member count and connection summary).<br>Off: No heartbeat line.</small>"
             input(name: "logDrivingTransitions", type: "bool", defaultValue: true, submitOnChange: true, title: "Driving Logging")
             paragraph "<small style='color:#666'>On: Each poll of a member in motion is logged.<br>Off: Only when a member starts or stops moving is logged.</small>"
             input(name: "logUnits", type: "enum", defaultValue: "life360", title: "Units (all members)",
@@ -602,7 +608,7 @@ def fetchMemberLocation(memberId, Map ctx = null) {
     int effectiveSecs = (settings.dynamicPolling && isMemberInTransit(memberId))
         ? dynamicPollFreqSecs()
         : pollFreqSecs()
-    long inflightMs = (state["inflight-${memberId}"] ?: 0L) as long
+    long inflightMs = (INFLIGHT[inflightKey(memberId)] ?: 0L) as long
     Integer httpTimeout = clamp(effectiveSecs, 5, DEFAULT_POLL_SECS)
     if (inflightMs > 0 && (startMs - inflightMs) < ((httpTimeout + 2) * 1000L)) {
         if (logEnable) log.debug("fetchMemberLocation: member:${memberDisplayName(memberId)}: prior request pending, skipping")
@@ -618,7 +624,7 @@ def fetchMemberLocation(memberId, Map ctx = null) {
         return
     }
 
-    state["inflight-${memberId}"] = startMs
+    INFLIGHT[inflightKey(memberId)] = startMs
 
     def params = life360Params("/circles/${circle}/members/${memberId}")
     params.timeout = httpTimeout
@@ -632,10 +638,15 @@ def fetchMemberLocation(memberId, Map ctx = null) {
     asynchttpGet("handleMemberLocationResponse", params, [memberId: memberId, ctx: ctx])
 }
 
+// Must be a real String: a GString key hashes differently and silently never matches the map entry.
+private String inflightKey(memberId) {
+    return "${app.id}-${memberId}".toString()
+}
+
 def handleMemberLocationResponse(response, Map data) {
     String memberId = data.memberId
     Map ctx = data.ctx
-    state.remove("inflight-${memberId}")  // clear in-flight marker (§7.1)
+    INFLIGHT.remove(inflightKey(memberId))  // clear in-flight marker (§7.1)
 
     String memberName = memberDisplayName(memberId)
 
@@ -668,7 +679,7 @@ def handleMemberLocationResponse(response, Map data) {
         // are case-insensitive by spec; search case-insensitively so a server casing change
         // can't silently disable the 304 optimization.
         def eTag = response.headers?.find { it.key?.equalsIgnoreCase("l360-etag") }?.value
-        if (eTag) state["etag-${memberId}"] = eTag
+        if (eTag && state["etag-${memberId}"] != eTag) state["etag-${memberId}"] = eTag
 
     } else if (status == 304) {
         if (state.watchdogWarned) log.info("WATCHDOG: cleared — Life360 fetch succeeded again (304)")
@@ -737,13 +748,16 @@ private long applyTransientBackoff(String memberId) {
 }
 
 private void markFetchSuccess(String memberId) {
-    state.failCount = 0
-    state.tokenLikelyExpired = false
-    state.rateLimitedUntilMs = null
-    state.message = null
-    state.lastSuccessMs = new Date().getTime()
-    state["transientCount-${memberId}"] = 0
-    state.remove("transientUntilMs-${memberId}")
+    // every write below is skipped when it would change nothing — steady state writes only lastSuccessMs
+    if (state.failCount) state.failCount = 0
+    if (state.tokenLikelyExpired) state.tokenLikelyExpired = false
+    if (state.rateLimitedUntilMs != null) state.rateLimitedUntilMs = null
+    if (state.message != null) state.message = null
+    long nowMs = new Date().getTime()
+    // watchdog threshold is >= 10 min, so 1-minute resolution is plenty
+    if (!state.lastSuccessMs || nowMs - (state.lastSuccessMs as long) >= 60000L) state.lastSuccessMs = nowMs
+    if (state["transientCount-${memberId}"]) state["transientCount-${memberId}"] = 0
+    if (state["transientUntilMs-${memberId}"] != null) state.remove("transientUntilMs-${memberId}")
     if (state.watchdogWarned) {
         state.watchdogWarned = false
     }
@@ -968,7 +982,7 @@ def updated() {
 
 def initialize(evt) {
     log.info("initialize: ${evt.device} ${evt.value} ${evt.name}")
-    clearSessionCache()             // clear any in-flight keys left over from before the hub restarted
+    clearSessionCache()             // drop session caches (etags, cookies, backoff) left over from before the restart
     removeObsoleteStateKeys()
     state.rateLimitedUntilMs = null // rate limit windows don't survive a reboot
     state.memberCount = null        // re-baseline so circles check fires immediately
@@ -981,11 +995,13 @@ def initialize(evt) {
 private void removeObsoleteStateKeys() {
     ["placesJson", "cachedHome", "scheduledBaseSecs", "pollIntervalSecs",
      "dynamicPollingActive", "memberInTransit", "lastCirclesFetchMs"].each { state.remove(it) }
+    removeStateKeysWithPrefix(["inflight-"])  // in-flight markers moved from state to the INFLIGHT map
 }
 
 
 def uninstalled() {
     log.info("uninstalled")
+    INFLIGHT.keySet().findAll { it.startsWith("${app.id}-") }.each { INFLIGHT.remove(it) }
     removeChildDevices(getChildDevices())
 }
 
@@ -1216,12 +1232,13 @@ def handleCirclesPollResponse(response, data) {
     boolean countChanged = (prevCount != null && newCount != prevCount)
     if (countChanged || isEmpty(state.members)) fetchMembers()
 
-    // heartbeat — fires on EVERY poll. Shows the count, any count change, and per-member
-    // connection status (issues.disconnected) so the log proves polling is alive and healthy.
+    // heartbeat — one line per poll, only if the logHeartbeat setting is on.
     // Use state.members.size() for the display — the /circles API no longer returns memberCount.
-    int displayCount = state.members?.size() ?: 0
-    String delta = countChanged ? " (${prevCount} → ${newCount})" : ""
-    log.info("heartbeat - ${circleName}: memberCount:${displayCount}${delta} ${memberStatusSummary()}")
+    if (settings.logHeartbeat) {
+        int displayCount = state.members?.size() ?: 0
+        String delta = countChanged ? " (${prevCount} → ${newCount})" : ""
+        log.info("heartbeat - ${circleName}: memberCount:${displayCount}${delta} ${memberStatusSummary()}")
+    }
 }
 
 /**
@@ -1304,6 +1321,7 @@ private void cleanupMemberState(String memberId) {
     (MEMBER_STATE_PREFIXES_SESSION + MEMBER_STATE_PREFIXES_IDENTITY).each { prefix ->
         state.remove("${prefix}${memberId}")
     }
+    INFLIGHT.remove(inflightKey(memberId))
 }
 
 /**
@@ -1336,21 +1354,15 @@ def notifyChildDevice(memberId, memberObj, Map ctx = null) {
     state.placesEmptyWarned = false
 
     // use pre-built context from fetchLocations() poll cycle, or build on the spot (§4.2)
-    String placesJson = ctx?.placesJson
-    def home = ctx?.home
-    if (placesJson == null) {
-        def built = buildPlacesContext()
-        placesJson = built.placesJson
-        home = built.home
-    }
+    def home = ctx ? ctx.home : buildPlacesContext().home
 
     def externalId = "${app.id}.${memberId}"
     try {
         // find the appropriate child device based on app id and the device network id
         def deviceWrapper = getChildDevice("${externalId}")
         if (deviceWrapper != null) {
-            // send location, places and home to device driver
-            boolean inTransit = deviceWrapper.generatePresenceEvent(memberObj, placesJson, home, ctx)
+            // send location and home to device driver
+            boolean inTransit = deviceWrapper.generatePresenceEvent(memberObj, null, home, ctx)  // places arg unused by driver; kept for the frozen app↔driver signature
             boolean prevInTransit = isMemberInTransit(memberId)
             boolean transitFlipped = (prevInTransit != inTransit)
             if (transitFlipped) {
@@ -1370,13 +1382,7 @@ def notifyChildDevice(memberId, memberObj, Map ctx = null) {
 }
 
 private Map buildPlacesContext() {
-    def thePlaces = state.places?.sort { a, b -> a.name <=> b.name } ?: []
-    def home = state.places?.find { it.id == settings.place }
-    def placesMap = [:]
-    for (rec in thePlaces) {
-        placesMap.put(rec.name, "${rec.latitude};${rec.longitude};${rec.radius}")
-    }
-    return [placesJson: new groovy.json.JsonBuilder(placesMap).toString(), home: home]
+    return [home: state.places?.find { it.id == settings.place }]
 }
 
 void captureCookies(response) {
@@ -1464,7 +1470,8 @@ private boolean mergeCookie(String cookieVal) {
     }
     boolean isNew = !jar.containsKey(name)
     jar[name] = value
-    state["cookies"] = jar.collect { k, v -> "${k}=${v}" }.join(";")
+    String merged = jar.collect { k, v -> "${k}=${v}" }.join(";")
+    if (merged != state["cookies"]) state["cookies"] = merged
     return isNew
 }
 
@@ -1475,6 +1482,7 @@ private boolean mergeCookie(String cookieVal) {
 void clearSessionCache() {
     if (logEnable) log.debug("clearSessionCache: dropping cookie jar [${cookieJarSummary()}] + etags/inflight/backoff (likely after auth failure)")
     state.remove("cookies")
+    INFLIGHT.keySet().findAll { it.startsWith("${app.id}-") }.each { INFLIGHT.remove(it) }
     // only session-scoped keys — identity keys (inTransit) survive a re-auth so transit state
     // isn't lost when a token is merely re-pasted.
     removeStateKeysWithPrefix(MEMBER_STATE_PREFIXES_SESSION)
