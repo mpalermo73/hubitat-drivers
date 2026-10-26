@@ -133,7 +133,7 @@ def mainPage() {
                 input("fetchMembersBtn", "button", title: "Fetch Members")
 
                 if (!isEmpty(state.members)) {
-                    def theMembers = state.members.collectEntries { [it.id, it.firstName + " " + it.lastName] }
+                    def theMembers = state.members.collectEntries { [it.id, "${it.firstName} ${it.lastName}".trim() ?: it.id] }
                     def sortedMembers = theMembers.sort { a, b -> a.value <=> b.value }
                     input "users", "enum", multiple: true, required: false, title: "Life360 Members: ", options: sortedMembers, submitOnChange: true, width: 6
                 }
@@ -205,7 +205,7 @@ def mainPage() {
                 paragraph "<small style='color:#666'>Push a location-update request to a member's phone. Life360 will ask the device for a fresh GPS fix (~5 seconds).</small>"
                 def forceMembers = state.members
                     .findAll { settings.users.contains(it.id) }
-                    .collectEntries { [it.id, "${it.firstName} ${it.lastName}".trim()] }
+                    .collectEntries { [it.id, "${it.firstName} ${it.lastName}".trim() ?: it.id] }
                     .sort { a, b -> a.value <=> b.value }
                 input "forceUpdateMember", "enum", multiple: false, required: false, title: "Member", options: forceMembers, submitOnChange: true, width: 6
                 input("forceUpdateBtn", "button", title: "Force Update")
@@ -537,12 +537,13 @@ def handleMembersResponse(response, data) {
         }
         if (rawMembers == null) {   // 200 without a roster: keep what we have rather than wiping state.members
             log.warn("fetchMembers: 200 response had no members list; keeping the existing roster")
+            if (!periodic) state.message = "fetchMembers: response had no members list"
             return
         }
         // store only the fields the app needs (id/firstName/lastName/issues) — the full
         // member object carries location, avatar, communications, etc. and is large; trimming
         // here keeps state small so every execution's deserialize cost stays low
-        def newMembers = rawMembers?.collect { [id: it.id, firstName: it.firstName, lastName: it.lastName, issues: [disconnected: it.issues?.disconnected]] }
+        def newMembers = rawMembers?.sort(false) { it.id }?.collect { [id: it.id, firstName: it.firstName ?: "", lastName: it.lastName ?: "", issues: [disconnected: it.issues?.disconnected ?: false]] }
         boolean rosterChanged = ((newMembers*.id ?: []) as Set) != ((state.members*.id ?: []) as Set)
         boolean detailsChanged = (newMembers != state.members)   // names or connected flag, not just who is in the circle
         if (detailsChanged) state.members = newMembers
@@ -567,6 +568,9 @@ def handleMembersResponse(response, data) {
     } else if (status == 401 || status == 403) {
         log.error("fetchMembers: AUTH (${status}) — token may be expired or revoked")
         if (!periodic) state.message = "fetchMembers: AUTH error (${status}) — re-paste access token"
+    } else if (status == 404) {
+        log.error("fetchMembers: circle not found (404) — all location updates will fail until you re-open Life360+ and select a valid circle")
+        if (!periodic) state.message = "fetchMembers: circle not found — re-open Life360+ and select a valid circle"
     } else {
         log.error("fetchMembers: bad response:${status}")
         if (!periodic) state.message = "fetchMembers: bad response:${status}"
@@ -1133,15 +1137,16 @@ def fastPollMember(data) {
     fetchMemberLocation(memberId, ctx)
 }
 
-/**
- * SLOW timer callback — watchdog + roster/heartbeat refresh + full member poll.
- */
 private void resetWatchdog() {
     rtSet("lastSuccessMs", null)
     rtSet("watchdogStartMs", null)
     if (state.watchdogWarned) state.watchdogWarned = false   // re-arm the rising-edge warning
+    if (state.message?.startsWith("WATCHDOG")) state.message = null   // its banner is stale once the clock restarts
 }
 
+/**
+ * SLOW timer callback — watchdog + roster/heartbeat refresh + full member poll.
+ */
 def handleSlowTimer() {
     // watchdog: if we haven't had a successful fetch in a long time, surface it loudly.
     // Threshold = max(pollFreq * 10, 10 minutes). state.message is rendered on mainPage,
@@ -1169,9 +1174,9 @@ def handleSlowTimer() {
     }
 
     // roster refresh — membership + heartbeat. Rides the slow tick but floored at MEMBERS_REFRESH_SECS
-    // (60s while there is no roster yet, so a failed first fetch retries soon). Skipped while auth is bad or rate-limited.
+    // (5 min while there is no roster yet, so a failed first fetch retries without spamming the log). Skipped while auth is bad or rate-limited.
     long lastMembersPollMs = rtGet("lastMembersPollMs") ?: 0L
-    long membersIntervalMs = isEmpty(state.members) ? 60000L : Math.max(pollFreqSecs(), MEMBERS_REFRESH_SECS) * 1000L
+    long membersIntervalMs = isEmpty(state.members) ? 300000L : Math.max(pollFreqSecs(), MEMBERS_REFRESH_SECS) * 1000L
     boolean rateLimited = state.rateLimitedUntilMs && now < state.rateLimitedUntilMs
     if (!isEmpty(circle) && !isEmpty(access_token) && !state.tokenLikelyExpired && !rateLimited
             && now - lastMembersPollMs >= membersIntervalMs - 5000L) {   // slack: cron jitter must not cost a whole extra tick
@@ -1239,7 +1244,7 @@ def handleTokenProbeResponse(response, data) {
  * Heartbeat line after a routine roster refresh, only if the logHeartbeat setting is on.
  */
 private void logHeartbeat() {
-    if (settings.logHeartbeat == false) return   // null (never saved) = default on
+    if (settings.logHeartbeat == false || isEmpty(state.members)) return   // null (never saved) = default on; nothing to report without a roster
     String circleName = showNamesInLogs() ? (state.circles?.find { it.id == settings.circle }?.name ?: settings.circle) : settings.circle
     log.info("heartbeat - ${circleName}: memberCount:${state.members?.size() ?: 0} ${memberStatusSummary()}")
 }
@@ -1277,7 +1282,7 @@ def createChildDevices() {
                 log.warn("createChildDevices: member ${memberId} not found in state.members — skipping")
                 return
             }
-            def memberName = member.firstName
+            def memberName = member.firstName ?: memberId
             log.info "createChildDevices: Creating Life360 Device: ${showNamesInLogs() ? memberName : memberId}"
             try {
                 addChildDevice("jpage4500", "Life360+ Driver", externalId, null, ["name": "Life360 - ${memberName}", isComponent: false])

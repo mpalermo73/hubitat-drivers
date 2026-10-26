@@ -160,6 +160,10 @@ def installed() {
     log.info "installed: Location Tracker User Driver Installed"
 }
 
+def uninstalled() {
+    LAST_SENT.remove(device.id as String)
+}
+
 def updated() {
     log.info "updated: Location Tracker User Driver has been Updated"
     LAST_SENT.remove(device.id as String)  // unit/threshold prefs may change derived values
@@ -214,6 +218,7 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     if (userActivity?.startsWith("os_")) {
         userActivity = userActivity.substring(3)
     }
+    if (!userActivity) userActivity = "unknown"   // Life360's own "no activity" value; always a real string, never a null event
 
     // -- name --
     String memberFirstName = (member.firstName) ? member.firstName : ""
@@ -396,14 +401,11 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
 
     // ** Member Communications **
     if (member.communications != null) {
-        member.communications.each { comm ->
-            String commType = comm.get('channel')
-            if (commType == "Voice") {
-                if (comm.value != device.currentValue("phone")) sendChanged("phone", comm.value)
-            } else if (commType == "Email") {
-                if (comm.value != device.currentValue("email")) sendChanged("email", comm.value)
-            }
-        }
+        // first entry per channel wins, so several numbers/addresses can't overwrite each other every poll
+        def voice = member.communications.find { it.get('channel') == "Voice" }
+        def email = member.communications.find { it.get('channel') == "Email" }
+        if (voice != null) sendChanged("phone", voice.value)
+        if (email != null) sendChanged("email", email.value)
     }
 
     // *** Timestamp ***
@@ -456,19 +458,7 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
 private void sendChanged(String name, value, String descriptionText = null) {
     Map last = LAST_SENT[device.id as String]
     if (last == null) { last = new java.util.concurrent.ConcurrentHashMap(); LAST_SENT[device.id as String] = last }
-    String nullKey = name + "?"
-    if (value == null) {   // clear a stale value once per cache lifetime; don't repeat it every poll
-        last.remove(name)
-        Object seen = last.putIfAbsent(nullKey, 1)
-        if (seen == null) {
-            if (device.currentValue(name) != null) sendEvent(name: name, value: null)
-        } else if (seen == 1 && device.currentValue(name) != null) {
-            last[nullKey] = 2   // warn once: the hub did not honor a null event, so the old value is still showing
-            log.warn "sendChanged: sendEvent(null) did not clear '${name}' (still '${device.currentValue(name)}')"
-        }
-        return
-    }
-    last.remove(nullKey)
+    if (value == null) return   // nothing to report (callers pass real values; phone/email may be absent)
     if (last[name] == value) return
     last[name] = value
     if (descriptionText) sendEvent(name: name, value: value, descriptionText: descriptionText)

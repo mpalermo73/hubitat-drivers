@@ -116,7 +116,7 @@ Added to eliminate magic literals: `FORCE_UPDATE_FETCH_DELAY_SECS = 6`, `CIRCLES
 ### New endpoints
 
 - **Force Update:** `POST /circles/<circleId>/members/<memberId>/request` with `body: {type: "location"}` via `forceMemberUpdate()` → `asynchttpPost` → `handleForceUpdateResponse`. Schedules `fetchLocations` 6 seconds later on success. UI: member dropdown + **Force Update** button in a section gated on `!isEmpty(settings.users)`.
-- **Roster refresh (supersedes the v4 `/circles` memberCount poll):** `handleSlowTimer` calls `fetchMembers(true)` (v3 `GET /circles/{id}/members`) at most once per `max(pollFreq, 900)` seconds (60s while no roster; memory-only `lastMembersPollMs`). `handleMembersResponse` compares member ids; an unchanged roster does no sync or push. v4 `/circles` is used only by the setup button. Done (`updated()`) refreshes immediately. `memberCount` and `lastCirclesPollMs` are obsolete and removed by `removeObsoleteStateKeys()`.
+- **Roster refresh (supersedes the v4 `/circles` memberCount poll):** `handleSlowTimer` calls `fetchMembers(true)` (v3 `GET /circles/{id}/members`) at most once per `max(pollFreq, 900)` seconds (~5 min while no roster; memory-only `lastMembersPollMs`). `handleMembersResponse` compares member ids; an unchanged roster does no sync or push. v4 `/circles` is used only by the setup button. Done (`updated()`) refreshes immediately. `memberCount` and `lastCirclesPollMs` are obsolete and removed by `removeObsoleteStateKeys()`.
 - **Membership → device reconciliation:** `handleMembersResponse` (the `fetchMembers` callback) now calls `createChildDevices()` on a 200 — creating devices for newly selected members, removing orphans — and pushes refreshed name/avatar/location to every selected member that has a device. Previously the membership poll refreshed only `state.members`; device create/cleanup happened solely on `installed()`/`updated()`.
 
 ### Child device management
@@ -158,7 +158,7 @@ Added to eliminate magic literals: `FORCE_UPDATE_FETCH_DELAY_SECS = 6`, `CIRCLES
 
 ### Presence event
 
-- Manual `sendEvent` dedup guards removed; Hubitat's built-in value-based deduplication relied on instead.
+- Manual `sendEvent` dedup guards removed; Hubitat's built-in value-based deduplication relied on instead. (Superseded in 5.2.4: the driver's `sendChanged()` skips unchanged values — see APP_SPEC §7.)
 - `home == null` guard added: returns `false` with a `log.warn` if the selected home place is not found (stale `settings.place`), instead of NPE-crashing the entire update.
 - `location.since` null-guarded: `.toLong()` called only when non-null; defaults to `0L`.
 - `descriptionText` "has arrived" / "has left" ternary parenthesization fixed (operator precedence bug caused it to always produce "arrived").

@@ -181,7 +181,7 @@ Base path `https://api-cloudfront.life360.com/v{version}`.
 | Purpose                        | Method + path                                     | Version | Notes                                                                                                                                                                                            |
 | ------------------------------ | ------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Poll one member's location** | `GET /circles/{circle}/members/{member}`          | 3       | **Core location call.** Per member, with that member's `If-None-Match`. `200` = changed (full member + `location`); `304` = unchanged (near-free). One per selected member per tick.             |
-| **Detect roster changes**      | `GET /circles/{circle}/members`                   | 3       | **Slow cadence (≤1 per 15 min, 60s while no roster).** Same call as below, flagged `periodic`: if the member-id set is unchanged it only refreshes `state.members` (when different) and logs the optional heartbeat. v4 `/circles` is no longer polled — it does not return `memberCount`. |
+| **Detect roster changes**      | `GET /circles/{circle}/members`                   | 3       | **Slow cadence (≤1 per 15 min, ~5 min while no roster).** Same call as below, flagged `periodic`: if the member-id set is unchanged it only refreshes `state.members` (when different) and logs the optional heartbeat. v4 `/circles` is no longer polled — it does not return `memberCount`. |
 | **Refresh membership / names** | `GET /circles/{circle}/members`                   | 3       | `fetchMembers()`: on **Done** (`updated()`), the **Fetch Members** button, or a periodic refresh that finds the roster changed. Refreshes `state.members`, reconciles child devices, pushes refreshed name/avatar/location.                            |
 | Force fresh GPS fix            | `POST /circles/{circle}/members/{member}/request` | 3       | Body `{"type":"location"}`, `Content-Type: application/json`. Returns `{requestId, isPollable}`. Cookies required (Cloudflare).                                                                  |
 
@@ -261,7 +261,7 @@ Notes to keep alongside the steps:
 
 1. **Watchdog** — if `lastSuccessMs` is older than `max(pollFreq×10, 10min)` and the token isn't
    flagged, log `WATCHDOG` once on the rising edge (`state.watchdogWarned`) and set a banner.
-2. **Roster refresh** — at most once per 15 minutes (`MEMBERS_REFRESH_SECS`, memory-only `lastMembersPollMs`; 60s while
+2. **Roster refresh** — at most once per 15 minutes (`MEMBERS_REFRESH_SECS`, memory-only `lastMembersPollMs`; ~5 min while
    `state.members` is empty; skipped while the token is flagged, rate-limited, or unset), call `fetchMembers(true)` (§4.2).
 3. **Locations** — if `tokenLikelyExpired`, fire `probeTokenAfterExpiry()` (§5) and return; otherwise
    call `fetchLocations()` (§4.1).
@@ -329,7 +329,7 @@ Notes:
 - **`markFetchSuccess(memberId)`** clears `failCount`, `tokenLikelyExpired`, `rateLimitedUntilMs`,
   `message`, `watchdogWarned`, `lastSuccessMs`, and that member's transient backoff state. Each write is
   skipped when it would change nothing (state writes are costly on Hubitat); `lastSuccessMs` is memory-only (`RUNTIME` map), so a steady-state poll writes no state. After a reboot the watchdog clock
-  (`watchdogStartMs`, set on the first tick once circle and members are configured) stands in until the first success.
+  (`watchdogStartMs`, set on the first tick once a circle and members are selected) stands in until the first success.
 
 ### 4.2 Membership refresh — the slow loop
 
@@ -344,6 +344,7 @@ handleMembersResponse(response):
   if !status: log + return
   captureCookiesAsync(response)
   if status == 200:
+    if rawMembers == null: warn; if !periodic: banner "response had no members list"; return   # keep the roster
     # trim to fields the app needs — keeps state.members small so every exec's deserialize is cheap
     newMembers = rawMembers.collect { [id, firstName, lastName, issues.disconnected] }
     rosterChanged = ids(newMembers) != ids(state.members)
@@ -355,6 +356,9 @@ handleMembersResponse(response):
     for memberId in settings.users:               # push refreshed name/avatar/location
       m = rawMembers.find { it.id == memberId }   # use rawMembers (untrimmed) for location push
       if m?.location: notifyChildDevice(memberId, m)
+  elif status in (401, 403): log; if !periodic: banner "AUTH error"
+  elif status == 404: log "circle not found"; if !periodic: banner "circle not found — re-open Life360+ and select a valid circle"
+  else: log; if !periodic: banner "bad response"
 ```
 
 **Heartbeat log.** A periodic roster refresh logs `log.info("heartbeat - ...")` only when the `logHeartbeat`
@@ -486,6 +490,7 @@ members (an auth failure or 429 affects every member).
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `200`                                                           | `notifyChildDevice`; store member etag; `markFetchSuccess(memberId)` clears `failCount`/`tokenLikelyExpired`/`rateLimitedUntilMs`, member's backoff, `lastSuccessMs`, watchdog                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `304`                                                           | `markFetchSuccess(memberId)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `404` on `/circles/{id}/members` (roster refresh, not per member)  | log.error "circle not found"; banner only on Done / Fetch Members (periodic refresh logs only) |
 | `401`/`403`                                                     | **account-level:** `clearSessionCache()` (drop cookies + all etags + inflight/backoff); `failCount++`; at `failCount >= 3` set `tokenLikelyExpired`, then `scheduleSlowTimer()` (slows loop to 300s) **before** `notifyTokenExpired()` — order matters: `scheduleSlowTimer()` calls `unschedule()` which would cancel the reminder job registered by `notifyTokenExpired()` if the order were reversed. Banner text names a re-paste; below 3, a transient "will retry" banner. **Known limitation:** `failCount` read-modify-write is racy across concurrent 401 callbacks — Hubitat state writes are not atomic and no lock primitive is available in the Groovy sandbox. Practical impact: the threshold may take 5–6 trips instead of 3 (delayed notification, not silent failure). No fix available. |
 | `429`                                                           | **account-level:** `rateLimitedUntilMs = now + (Retry-After ?: 60) + 10s` — pauses the whole loop. Transient banner.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | any `5xx` except `501`/`505` / network error (no status) | **per-member** exponential backoff (below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -578,7 +583,7 @@ The driver is the stable part; nearly all change is app-side. Entry point:
 `generatePresenceEvent(member, places, home, ctx)` (`places` is always `null` now; the driver ignores it) → returns a boolean `inTransit` the app reads.
 
 - Attributes go through `sendChanged()`, which skips `sendEvent` when the value equals the last one sent
-  (`LAST_SENT`, memory-only, keyed by `device.id`; cleared by `arrived()`, `departed()`, `updated()`). The first
+  (`LAST_SENT`, memory-only, keyed by `device.id`; `arrived()`/`departed()` drop only the `presence` entry; `updated()` and `uninstalled()` drop the whole entry). The first
   poll after a reboot or code save resends everything. Do not "restore" unconditional `sendEvent` calls.
 - Null-safe: returns `false` early if `member` or `member.location` is null, or if `home` is null
   (a stale `settings.place` whose Life360 place was removed) — with a `log.error`, never an NPE.
