@@ -42,7 +42,7 @@
 - **`sEpoch.seconds` wrong epoch calculation (DRIVER-BUG-3).** `use(TimeCategory) { new Date(0) + sEpoch.seconds }` treated the Unix timestamp as a duration, producing dates ~55,000 years in the future. Fixed: `new Date(sEpoch * 1000L)`. _(Note: claimed fixed in `41f8549` but the change was never actually applied; corrected in the subsequent commit.)_
 - **Integer division truncated lat/lng coordinates to whole degrees (DRIVER-BUG-4).** `Math.round(toDouble(lat) * LAT_LNG_PRECISION) / LAT_LNG_PRECISION` — `LAT_LNG_PRECISION` is a `long`, so `long / long` in Groovy is integer division, truncating e.g. `37.12345` to `37`. This caused the Google Maps link in the "moving @" info log to point to the wrong location (city center instead of actual position), and corrupted history storage and haversine distance calculations. Same bug existed in `saveLocationHistory`. Fixed: `/ (LAT_LNG_PRECISION as double)` to force floating-point division.
 - **`unschedule()` killed the token-expiry reminder chain (BUG-SCHED).** `scheduleUpdates()` calls `unschedule()` (no argument), which cancels every scheduled job. If the token was already expired when the user clicked Done with a different poll frequency, the reminder chain was silently killed and never re-armed. Fixed: `if (state.tokenLikelyExpired) notifyTokenExpired()` immediately after `unschedule()`.
-- **In-flight keys survived hub restart (STATE-2).** `inflight-<memberId>` is set before `asynchttpGet` and cleared in the callback. A hub reboot mid-request meant the callback never fired and the key was never cleared, permanently blocking that member's poll loop. Fixed: `initialize()` now calls `clearSessionCache()` before re-arming the schedule.
+- **In-flight keys survived hub restart (STATE-2).** `inflight-<memberId>` was set in `state` before `asynchttpGet` and cleared in the callback (later moved to the memory-only `INFLIGHT` map). A hub reboot mid-request meant the callback never fired and the key was never cleared, permanently blocking that member's poll loop. Fixed: `initialize()` now calls `clearSessionCache()` before re-arming the schedule.
 - **`handleTokenProbeResponse` could stay stuck in slow-poll on a garbled 200 (ERR-2).** `captureUnitOfMeasure(response.json)` ran before `state.tokenLikelyExpired = false`. A Cloudflare interstitial on a 200 would throw and leave the flag set despite a valid auth response. Fixed: all state clears moved before the JSON parse.
 
 ### Error handling
@@ -78,10 +78,10 @@ Added to eliminate magic literals: `FORCE_UPDATE_FETCH_DELAY_SECS = 6`, `CIRCLES
 
 ### Async fetch architecture
 
-- `fetchMemberLocation` converted from synchronous `httpGet` to `asynchttpGet` → `handleMemberLocationResponse`. Per-member in-flight guard (`state["inflight-${memberId}"]`) skips re-entry if a prior request is still pending (timeout + 2s window).
+- `fetchMemberLocation` converted from synchronous `httpGet` to `asynchttpGet` → `handleMemberLocationResponse`. Per-member in-flight guard (now the memory-only `INFLIGHT` map) skips re-entry if a prior request is still pending (timeout + 2s window).
 - `fetchMembers` converted from synchronous `httpGet` to `asynchttpGet` → `handleMembersResponse`.
-- `places` context built once per poll cycle in `buildPlacesContext()` (sorted places map + serialized JSON + home reference) and passed to each member fetch as `data.ctx`, rather than rebuilt per-member per-tick inside `notifyChildDevice`.
-- `savedPlaces` JSON serialized once in the app and passed as a string to the driver; previously the driver re-serialized a raw Map N times per tick.
+- `places` context built once per poll cycle in `buildPlacesContext()` (now just the selected home place; the places map/JSON was dropped as unused) and passed to each member fetch as `data.ctx`, rather than rebuilt per-member per-tick inside `notifyChildDevice`.
+- (Superseded) `savedPlaces` JSON was once serialized in the app and passed to the driver; the driver never used it, so the app now passes `null`.
 
 ### Scheduling
 
@@ -103,7 +103,7 @@ Added to eliminate magic literals: `FORCE_UPDATE_FETCH_DELAY_SECS = 6`, `CIRCLES
 - Auth failures (`401`/`403`) in `handleMemberLocationResponse` now log `jar-at-failure [...]` (cookie names) before clearing session, distinguishing a token problem from a cookie-path problem.
 - Per-member exponential transient backoff for any `5xx` except the permanent `501`/`505` **and** network-level failures (no HTTP status): `state["transientCount-${memberId}"]` increments on each consecutive error; delay = `min(pollSecs * 2^(count-1), 300s)`. Bit-shift exponent capped at 6 to prevent `long` overflow. Clears on success.
 - Rate-limit (`429`) handling extracts `Retry-After` header from async response headers (Map lookup, not `getFirstHeader`), adds 10s margin.
-- `clearSessionCache()` extended to also remove `inflight-*`, `transientCount-*`, `transientUntilMs-*` keys in addition to `etag-*` and `cookies`.
+- `clearSessionCache()` extended to also remove (at the time) `inflight-*`, `transientCount-*`, `transientUntilMs-*` keys in addition to `etag-*` and `cookies`.
 - Watchdog fires only on the rising edge (`state.watchdogWarned` flag); previously logged on every tick after threshold exceeded.
 
 ### Cookie management
@@ -116,7 +116,7 @@ Added to eliminate magic literals: `FORCE_UPDATE_FETCH_DELAY_SECS = 6`, `CIRCLES
 ### New endpoints
 
 - **Force Update:** `POST /circles/<circleId>/members/<memberId>/request` with `body: {type: "location"}` via `forceMemberUpdate()` → `asynchttpPost` → `handleForceUpdateResponse`. Schedules `fetchLocations` 6 seconds later on success. UI: member dropdown + **Force Update** button in a section gated on `!isEmpty(settings.users)`.
-- **Circles poll:** `handleSlowTimer` fires `asynchttpGet` to `GET /circles` (v4, `CIRCLES_API_VERSION`) at most once per `max(pollFreq, 60)` seconds (rate-limited via `state.lastCirclesPollMs`). `handleCirclesPollResponse` compares `circle.memberCount` against `state.memberCount`; triggers `fetchMembers()` on change or on first-seen baseline. v4 is used for both the setup button and the steady-state poll. The `lastCirclesFetchMs` key is obsolete and removed by `removeObsoleteStateKeys()`.
+- **Roster refresh (supersedes the v4 `/circles` memberCount poll):** `handleSlowTimer` calls `fetchMembers(true)` (v3 `GET /circles/{id}/members`) at most once per `max(pollFreq, 900)` seconds (60s while no roster; memory-only `lastMembersPollMs`). `handleMembersResponse` compares member ids; an unchanged roster does no sync or push. v4 `/circles` is used only by the setup button. Done (`updated()`) refreshes immediately. `memberCount` and `lastCirclesPollMs` are obsolete and removed by `removeObsoleteStateKeys()`.
 - **Membership → device reconciliation:** `handleMembersResponse` (the `fetchMembers` callback) now calls `createChildDevices()` on a 200 — creating devices for newly selected members, removing orphans — and pushes refreshed name/avatar/location to every selected member that has a device. Previously the membership poll refreshed only `state.members`; device create/cleanup happened solely on `installed()`/`updated()`.
 
 ### Child device management
@@ -132,7 +132,7 @@ Added to eliminate magic literals: `FORCE_UPDATE_FETCH_DELAY_SECS = 6`, `CIRCLES
 - One-shot pending flags (`state.tokenStatusPending`, `state.forceUpdateStatusPending`) prevent stale results from persisting across page navigations while ensuring button results survive the single re-render after a button press.
 - All short `input` elements get `width: 6` (half-width) to avoid comically wide dropdowns.
 - "Other Options" section split into **Polling**, **Notifications**, **Logging**, **Map View**.
-- New **STEP 5: Verify Connectivity** shows age of `state.lastSuccessMs` as "Ns ago / N min ago / N hr ago".
+- New **STEP 5: Verify Connectivity** shows age of `lastSuccessMs` (now memory-only, `RUNTIME` map) as "Ns ago / N min ago / N hr ago".
 - **Revoke Map Link** button added; `revokeViewLink()` nulls `state.accessToken`.
 - OAuth instructions moved from `description:` (placeholder text) to a `paragraph`.
 
@@ -166,7 +166,7 @@ Added to eliminate magic literals: `FORCE_UPDATE_FETCH_DELAY_SECS = 6`, `CIRCLES
 
 ### Places
 
-- `thePlaces` parameter accepts either a pre-serialized JSON string (from app's `buildPlacesContext`) or a raw Map (backward compat). String path skips re-serialization.
+- (Superseded) `thePlaces` is now ignored by the driver; the app passes `null`.
 
 ### Privacy / logging
 

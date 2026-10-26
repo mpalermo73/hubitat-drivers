@@ -1,4 +1,5 @@
 - [Life360+ Changelog](#life360-changelog)
+  - [5.2.4 (testing)](#524-testing)
   - [5.2.3](#523)
   - [5.2.2](#522)
   - [5.2.1](#521)
@@ -16,13 +17,25 @@
 
 # Life360+ Changelog
 
+## 5.2.4 (testing)
+
+**Fresh, hub-untested changes — try on a spare/low-risk setup first.** Goal: less I/O on small hubs, no functional change.
+
+- **Driver sends events only when a value changed** (was: every attribute on every update). `lastUpdated` and the dashboard tile still update each time. A null `userActivity` is cleared once, then left alone; if the hub ignores that, a one-time warning is logged.
+- **Fewer state writes in the app:** in-flight markers, the last-success time and the roster-refresh time are kept in memory instead of `state`; unchanged etag/cookie/roster values are no longer rewritten.
+- **The per-minute v4 `/circles` poll is gone.** The member roster (`/members`) is re-read at most every 15 minutes instead (and immediately when you press Done); it picks up joins/leaves and name changes. v4 `/circles` is only used by the setup picker, since it no longer returns `memberCount`.
+- **Heartbeat log is now once per roster refresh (~15 min) instead of every poll,** and there is a new **Heartbeat Logging** setting (default on) to turn it off.
+- **Watchdog fixes:** it restarts after a reboot, Done or token recovery, no longer fires when nothing is configured, and a routine roster refresh no longer erases a watchdog or error banner.
+- A roster response with no member list no longer wipes the saved roster.
+- The unused places data is no longer built or passed to the driver.
+
 ## 5.2.3
 
 **Any 5xx is now treated as a transient error.** Retryable statuses were an explicit allow-list that omitted 500 — which Life360 routinely returns for a single member while the rest of the circle succeeds. A 500 therefore fell through to the generic error path: red `unexpected response:500` in the log, no per-member backoff, retried at full poll rate. The check is now "any 5xx except the permanently-fatal 501/505", so unanticipated codes (Cloudflare has a dozen in the 520s) get exponential backoff instead of log spam.
 
 ## 5.2.2
 
-**Fixed the heartbeat log always showing `memberCount:0`** on the newer `/circles` API endpoint, which no longer returns `memberCount`.
+**Fixed the heartbeat log always showing `memberCount:0`** on the newer `/circles` API endpoint, which no longer returns `memberCount`; the count now comes from the `/members` roster.
 
 **Added a "Driving Logging" option.** When off, a member in motion is logged only when they start and stop moving, instead of on every poll. Reduces log spam when several members are travelling.
 
@@ -50,7 +63,7 @@ Significant update from the 5.1.3 / 5.1.4 baseline. Core theme: **the integratio
 - **Check Token** — validates your access token with an inline success/failure result on the settings page, including a "Hi, name!" confirmation. Also re-reads the account's units preference.
 - **Units auto-detected** — speed and distance follow your Life360 account's imperial/metric preference, fetched automatically from `/users/me`. The per-device `unitOverride` setting is a fallback only (old `isMiles` bool is migrated automatically).
 - **Dynamic polling reacts immediately** — when a member starts or stops moving, the polling rate switches on the same tick instead of lagging a full cycle.
-- **Membership auto-sync** — a once-per-minute circles poll watches the circle's member count; when it changes, the member list is refreshed and child devices are reconciled (new members get a device, departed members' devices are removed) and existing devices get refreshed names/avatars — no need to reopen the app.
+- **Membership auto-sync** — the member roster is re-read at most every 15 min (and immediately on Done); when the set of members changes, child devices are reconciled (new members get a device, departed members' devices are removed) and existing devices get refreshed names/avatars — no need to reopen the app.
 
 ### Settings page
 

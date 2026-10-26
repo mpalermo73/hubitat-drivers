@@ -5,6 +5,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 // In-flight request markers, keyed "<appId>-<memberId>" (use inflightKey()). Memory-only: a hub reboot clears them, so a lost callback can never leave a member stuck.
 @Field static final ConcurrentHashMap INFLIGHT = new ConcurrentHashMap()
+// Memory-only timestamps (lastSuccessMs, watchdogStartMs, lastMembersPollMs), keyed "<appId>-<name>" (use rtGet/rtSet). Kept out of state so a steady-state poll dirties nothing; a reboot just resets them.
+@Field static final ConcurrentHashMap RUNTIME = new ConcurrentHashMap()
 
 @Field static final int    TOKEN_EXPIRED_POLL_SECS         = 300   // slow-poll rate when token is flagged expired
 @Field static final int    AUTH_FAIL_THRESHOLD             = 3     // consecutive 401/403s before flagging token expired
@@ -17,7 +19,7 @@ import java.util.concurrent.ConcurrentHashMap
 @Field static final int    FORCE_UPDATE_FETCH_DELAY_SECS   = 6     // seconds to wait after force-update before re-fetching (~5s for Life360 to push fresh GPS)
 @Field static final int    CIRCLES_API_VERSION             = 4     // Life360 API version for the /circles endpoint
 @Field static final int    MAX_BACKOFF_SHIFT               = 6     // max bit-shift for exponential backoff (caps at 2^6 = 64× base interval)
-@Field static final int    CIRCLES_MIN_POLL_SECS           = 60    // floor for /circles polling — membership rarely changes, so never hit it faster than this even at a fast pollFreq
+@Field static final int    MEMBERS_REFRESH_SECS            = 900   // how often the roster (/members) is re-read — membership rarely changes, so never hit it faster than this even at a fast pollFreq
 @Field static final String LIFE360_BASE_URL_V3             = "https://api-cloudfront.life360.com/v3"
 @Field static final String LIFE360_BASE_URL_V4             = "https://api-cloudfront.life360.com/v4"
 
@@ -140,8 +142,9 @@ def mainPage() {
             section(header("STEP 5: Verify Connectivity")) {
                 paragraph "<small style='color:#666'>Pulls current data for every selected member. Use this to confirm setup before saving.  If it fails, check the access token (STEP 1) and try again.</small>"
                 input("fetchLocationsBtn", "button", title: "Fetch Locations")
-                if (state.lastSuccessMs) {
-                    long ageSec = (long)((new Date().getTime() - state.lastSuccessMs) / 1000L)
+                Long lastSuccessMs = rtGet("lastSuccessMs")
+                if (lastSuccessMs) {
+                    long ageSec = (long)((new Date().getTime() - lastSuccessMs) / 1000L)
                     String ageStr = (ageSec < SECS_PER_MIN) ? "${ageSec}s ago"
                         : (ageSec < SECS_PER_HOUR) ? "${(long)(ageSec / SECS_PER_MIN)} min ago"
                         : "${(long)(ageSec / SECS_PER_HOUR)} hr ago"
@@ -175,8 +178,8 @@ def mainPage() {
             input(name: "logRawPayload", type: "bool", defaultValue: false, submitOnChange: true, title: "Log Raw API Diagnostics", description: "Verbose. Logs sensitive data (GPS, partial token, cookies, payloads). Debug only — don't share resulting logs.")
             input(name: "logShowNames", type: "bool", defaultValue: true, submitOnChange: true, title: "Include Names and Places in Logs", description: "When on, logs show member/place/circle names. Turn off for privacy (UUIDs only) — useful when sharing logs for debugging.")
             input(name: "logShowMapsLink", type: "bool", defaultValue: true, submitOnChange: true, title: "Include Google Maps Link in Logs", description: "When a member moves, include a clickable Google Maps link to their coordinates in the info log. Turn off to keep coordinates out of logs.")
-            input(name: "logHeartbeat", type: "bool", defaultValue: false, submitOnChange: true, title: "Heartbeat Logging")
-            paragraph "<small style='color:#666'>On: A heartbeat line is logged on every poll (member count and connection summary).<br>Off: No heartbeat line.</small>"
+            input(name: "logHeartbeat", type: "bool", defaultValue: true, submitOnChange: true, title: "Heartbeat Logging")
+            paragraph "<small style='color:#666'>On: A heartbeat line is logged on every roster refresh, about every 15 minutes (member count and connection summary).<br>Off: No heartbeat line.</small>"
             input(name: "logDrivingTransitions", type: "bool", defaultValue: true, submitOnChange: true, title: "Driving Logging")
             paragraph "<small style='color:#666'>On: Each poll of a member in motion is logged.<br>Off: Only when a member starts or stops moving is logged.</small>"
             input(name: "logUnits", type: "enum", defaultValue: "life360", title: "Units (all members)",
@@ -499,22 +502,23 @@ def fetchPlaces() {
     }
 }
 
-def fetchMembers() {
+def fetchMembers(boolean periodic = false) {
     if (isEmpty(circle)) {
         log.warn("fetchMembers: circle not set")
         return;
     }
     def params = life360Params("/circles/${circle}/members")
     if (getLogRawPayload()) log.trace("fetchMembers: GET ${params.uri}")
-    asynchttpGet("handleMembersResponse", params)
+    asynchttpGet("handleMembersResponse", params, [periodic: periodic])
 }
 
 def handleMembersResponse(response, data) {
+    boolean periodic = (data?.periodic == true)   // routine refreshes only log: they must not touch state.message (location-path banners live there)
     Integer status = response.status
     if (!status) {
         String errMsg = response.getErrorMessage() ?: "(no details)"
         log.error("fetchMembers: network error: ${errMsg}")
-        state.message = "fetchMembers: network error: ${errMsg}"
+        if (!periodic) state.message = "fetchMembers: network error: ${errMsg}"
         return
     }
 
@@ -528,15 +532,26 @@ def handleMembersResponse(response, data) {
             rawMembers = response.json?.members
         } catch (e) {
             log.error("fetchMembers: failed to parse response JSON: ${e.message}")
-            state.message = "fetchMembers: invalid response body (parse error)"
+            if (!periodic) state.message = "fetchMembers: invalid response body (parse error)"
+            return
+        }
+        if (rawMembers == null) {   // 200 without a roster: keep what we have rather than wiping state.members
+            log.warn("fetchMembers: 200 response had no members list; keeping the existing roster")
             return
         }
         // store only the fields the app needs (id/firstName/lastName/issues) — the full
         // member object carries location, avatar, communications, etc. and is large; trimming
         // here keeps state small so every execution's deserialize cost stays low
-        state.members = rawMembers?.collect { [id: it.id, firstName: it.firstName, lastName: it.lastName, issues: [disconnected: it.issues?.disconnected]] }
+        def newMembers = rawMembers?.collect { [id: it.id, firstName: it.firstName, lastName: it.lastName, issues: [disconnected: it.issues?.disconnected]] }
+        boolean rosterChanged = ((newMembers*.id ?: []) as Set) != ((state.members*.id ?: []) as Set)
+        boolean detailsChanged = (newMembers != state.members)   // names or connected flag, not just who is in the circle
+        if (detailsChanged) state.members = newMembers
         if (logEnable) log.debug("fetchMembers: ${state.members?.size() ?: 0} members: ${state.members?.collect { showNamesInLogs() ? it.firstName : it.id }}")
-        state.message = null
+        if (!periodic && state.message != null) state.message = null
+        if (periodic) {
+            logHeartbeat()
+            if (!rosterChanged && !detailsChanged) return   // routine refresh, nothing different: no sync or push
+        }
 
         // sync child devices: create for newly selected members, remove departed ones
         syncChildDevices()
@@ -551,10 +566,10 @@ def handleMembersResponse(response, data) {
         }
     } else if (status == 401 || status == 403) {
         log.error("fetchMembers: AUTH (${status}) — token may be expired or revoked")
-        state.message = "fetchMembers: AUTH error (${status}) — re-paste access token"
+        if (!periodic) state.message = "fetchMembers: AUTH error (${status}) — re-paste access token"
     } else {
         log.error("fetchMembers: bad response:${status}")
-        state.message = "fetchMembers: bad response:${status}"
+        if (!periodic) state.message = "fetchMembers: bad response:${status}"
     }
 }
 
@@ -637,6 +652,14 @@ def fetchMemberLocation(memberId, Map ctx = null) {
 
     asynchttpGet("handleMemberLocationResponse", params, [memberId: memberId, ctx: ctx])
 }
+
+Long rtGet(String name) { return RUNTIME[rtKey(name)] as Long }
+
+void rtSet(String name, Long value) {
+    if (value == null) RUNTIME.remove(rtKey(name)) else RUNTIME[rtKey(name)] = value
+}
+
+String rtKey(String name) { return "${app.id}-${name}".toString() }
 
 // Must be a real String: a GString key hashes differently and silently never matches the map entry.
 private String inflightKey(memberId) {
@@ -748,14 +771,13 @@ private long applyTransientBackoff(String memberId) {
 }
 
 private void markFetchSuccess(String memberId) {
-    // every write below is skipped when it would change nothing — steady state writes only lastSuccessMs
+    // every write below is skipped when it would change nothing — steady state writes no state at all
     if (state.failCount) state.failCount = 0
     if (state.tokenLikelyExpired) state.tokenLikelyExpired = false
     if (state.rateLimitedUntilMs != null) state.rateLimitedUntilMs = null
     if (state.message != null) state.message = null
     long nowMs = new Date().getTime()
-    // watchdog threshold is >= 10 min, so 1-minute resolution is plenty
-    if (!state.lastSuccessMs || nowMs - (state.lastSuccessMs as long) >= 60000L) state.lastSuccessMs = nowMs
+    rtSet("lastSuccessMs", nowMs)
     if (state["transientCount-${memberId}"]) state["transientCount-${memberId}"] = 0
     if (state["transientUntilMs-${memberId}"] != null) state.remove("transientUntilMs-${memberId}")
     if (state.watchdogWarned) {
@@ -972,8 +994,11 @@ def updated() {
     state.message = null
     unschedule("sendTokenExpiryReminder")  // clear any pending repeat reminder (§5.2)
     state.tokenStatus = null        // clear so a freshly-pasted token doesn't show stale status
-    state.memberCount = null        // re-baseline after any circle/membership config change
-    state.lastCirclesPollMs = null  // fire the circles check on the next tick (don't wait out the floor)
+    resetWatchdog()                 // restart the clock so the pre-fix gap can't trigger a stale WATCHDOG warning
+    if (!isEmpty(circle) && !isEmpty(access_token)) {   // Done = refresh the roster now, don't wait out the floor
+        rtSet("lastMembersPollMs", new Date().getTime())
+        fetchMembers()
+    }
     removeObsoleteStateKeys()
     syncChildDevices()
     refreshUserSettings()           // refresh the account's units preference (settings.unitOfMeasure)
@@ -985,8 +1010,8 @@ def initialize(evt) {
     clearSessionCache()             // drop session caches (etags, cookies, backoff) left over from before the restart
     removeObsoleteStateKeys()
     state.rateLimitedUntilMs = null // rate limit windows don't survive a reboot
-    state.memberCount = null        // re-baseline so circles check fires immediately
-    state.lastCirclesPollMs = null  // fire circles check on first tick after reboot
+    rtSet("lastMembersPollMs", null)  // refresh the roster on the first tick after reboot
+    resetWatchdog()                   // a warning from before the reboot must not mute the new clock
     syncChildDevices()
     refreshUserSettings()
     scheduleSlowTimer()
@@ -994,7 +1019,7 @@ def initialize(evt) {
 
 private void removeObsoleteStateKeys() {
     ["placesJson", "cachedHome", "scheduledBaseSecs", "pollIntervalSecs",
-     "dynamicPollingActive", "memberInTransit", "lastCirclesFetchMs"].each { state.remove(it) }
+     "dynamicPollingActive", "memberInTransit", "lastCirclesFetchMs", "lastSuccessMs", "lastCirclesPollMs", "memberCount"].each { state.remove(it) }
     removeStateKeysWithPrefix(["inflight-"])  // in-flight markers moved from state to the INFLIGHT map
 }
 
@@ -1002,6 +1027,7 @@ private void removeObsoleteStateKeys() {
 def uninstalled() {
     log.info("uninstalled")
     INFLIGHT.keySet().findAll { it.startsWith("${app.id}-") }.each { INFLIGHT.remove(it) }
+    RUNTIME.keySet().findAll { it.startsWith("${app.id}-") }.each { RUNTIME.remove(it) }
     removeChildDevices(getChildDevices())
 }
 
@@ -1015,7 +1041,7 @@ def refresh() {
 
 /**
  * Arm the SLOW timer — the steady-state poll that fetches every selected member, refreshes
- * the circle/heartbeat, and runs the watchdog. Fires at the user's Default Refresh Rate
+ * the roster/heartbeat, and runs the watchdog. Fires at the user's Default Refresh Rate
  * (settings.pollFreq), or every 5 min while the token is flagged expired (probe-only).
  * Members in motion are additionally polled by per-member runIn chains (see ensureFastChain).
  */
@@ -1108,16 +1134,27 @@ def fastPollMember(data) {
 }
 
 /**
- * SLOW timer callback — watchdog + circle/heartbeat refresh + full member poll.
+ * SLOW timer callback — watchdog + roster/heartbeat refresh + full member poll.
  */
+private void resetWatchdog() {
+    rtSet("lastSuccessMs", null)
+    rtSet("watchdogStartMs", null)
+    if (state.watchdogWarned) state.watchdogWarned = false   // re-arm the rising-edge warning
+}
+
 def handleSlowTimer() {
     // watchdog: if we haven't had a successful fetch in a long time, surface it loudly.
     // Threshold = max(pollFreq * 10, 10 minutes). state.message is rendered on mainPage,
     // and a log.warn shows up in Hubitat's main log so the user can see something is wrong
     // without needing to rely on the auto_reboot script.
     Long now = new Date().getTime()
-    if (state.lastSuccessMs != null) {
-        long ageMs = now - state.lastSuccessMs
+    Long watchdogBaseMs = rtGet("lastSuccessMs") ?: rtGet("watchdogStartMs")
+    if (isEmpty(circle) || isEmpty(settings.users)) {
+        resetWatchdog()   // nothing to poll, so nothing to watch (deselecting everyone must not look like an outage)
+    } else if (watchdogBaseMs == null) {
+        rtSet("watchdogStartMs", now)   // after a reboot/save, start the clock now so a never-recovering fetch still trips it
+    } else {
+        long ageMs = now - watchdogBaseMs
         int pollFreqSec = pollFreqSecs()
         long thresholdMs = Math.max((long)(pollFreqSec * 10L * 1000L), (long)(10L * 60L * 1000L))
         if (ageMs > thresholdMs && !state.tokenLikelyExpired) {
@@ -1131,16 +1168,15 @@ def handleSlowTimer() {
         }
     }
 
-    // circles check — membership + heartbeat. Rides the slow tick but floored at
-    // CIRCLES_MIN_POLL_SECS so a fast pollFreq can't flood /circles for near-static data.
-    long lastCirclesPollMs = (state.lastCirclesPollMs ?: 0L) as long
-    long circlesIntervalMs = Math.max(pollFreqSecs(), CIRCLES_MIN_POLL_SECS) * 1000L
-    if (now - lastCirclesPollMs >= circlesIntervalMs) {
-        state.lastCirclesPollMs = now
-        def circlesParams = life360Params("/circles", CIRCLES_API_VERSION)
-        def cookies = state["cookies"]
-        if (cookies) circlesParams["headers"]["Cookie"] = cookies
-        asynchttpGet("handleCirclesPollResponse", circlesParams)
+    // roster refresh — membership + heartbeat. Rides the slow tick but floored at MEMBERS_REFRESH_SECS
+    // (60s while there is no roster yet, so a failed first fetch retries soon). Skipped while auth is bad or rate-limited.
+    long lastMembersPollMs = rtGet("lastMembersPollMs") ?: 0L
+    long membersIntervalMs = isEmpty(state.members) ? 60000L : Math.max(pollFreqSecs(), MEMBERS_REFRESH_SECS) * 1000L
+    boolean rateLimited = state.rateLimitedUntilMs && now < state.rateLimitedUntilMs
+    if (!isEmpty(circle) && !isEmpty(access_token) && !state.tokenLikelyExpired && !rateLimited
+            && now - lastMembersPollMs >= membersIntervalMs - 5000L) {   // slack: cron jitter must not cost a whole extra tick
+        rtSet("lastMembersPollMs", now)
+        fetchMembers(true)
     }
 
     // when the token is flagged expired, probe /users/me instead of fetching locations —
@@ -1180,6 +1216,7 @@ def handleTokenProbeResponse(response, data) {
         // service is back — auto-recover; clear state before the JSON parse so a garbled
         // 200 body doesn't leave the app stuck in slow-poll (a valid 200 means auth is OK)
         log.info("tokenProbe: 200 OK — token is valid; auto-recovering from expired state")
+        resetWatchdog()   // restart the watchdog clock (see updated())
         state.tokenLikelyExpired = false
         state.failCount = 0
         state.rateLimitedUntilMs = null
@@ -1198,47 +1235,13 @@ def handleTokenProbeResponse(response, data) {
     }
 }
 
-def handleCirclesPollResponse(response, data) {
-    Integer status = response.status
-    if (!status) {
-        log.warn("fetchCircles: poll: network error: ${response.getErrorMessage() ?: "(no details)"}")
-        return
-    }
-    captureCookiesAsync(response)
-    if (getLogRawPayload()) { try { log.trace("fetchCircles: poll: ${status} ${response.json}") } catch (ignored) {} }
-    if (status == 401 || status == 403) {
-        log.error("fetchCircles: poll: AUTH (${status}) — token may be expired or revoked")
-        return
-    } else if (status != 200) {
-        log.warn("fetchCircles: poll: unexpected status:${status}")
-        return
-    }
-
-    def circle = response.json?.circles?.find { it.id == settings.circle }
-    if (!circle) {
-        log.error("fetchCircles: poll: configured circle not found in response — all location updates will fail until you re-open Life360+ and select a valid circle")
-        return
-    }
-
-    String circleName = showNamesInLogs() ? (circle.name ?: circle.id) : circle.id
-    int newCount = circle.memberCount?.toInteger() ?: 0
-    Integer prevCount = (state.memberCount != null) ? (state.memberCount as int) : null
-    state.memberCount = newCount
-
-    // refresh the member roster when the count actually changes, or when we don't have a roster
-    // yet. NOT on a mere re-baseline (prevCount nulled by updated()) with the roster already
-    // loaded — that would burn an API call on every Done/reboot for no new data. Note prevCount
-    // is null on re-baseline, so guard the change-compare with prevCount != null.
-    boolean countChanged = (prevCount != null && newCount != prevCount)
-    if (countChanged || isEmpty(state.members)) fetchMembers()
-
-    // heartbeat — one line per poll, only if the logHeartbeat setting is on.
-    // Use state.members.size() for the display — the /circles API no longer returns memberCount.
-    if (settings.logHeartbeat) {
-        int displayCount = state.members?.size() ?: 0
-        String delta = countChanged ? " (${prevCount} → ${newCount})" : ""
-        log.info("heartbeat - ${circleName}: memberCount:${displayCount}${delta} ${memberStatusSummary()}")
-    }
+/**
+ * Heartbeat line after a routine roster refresh, only if the logHeartbeat setting is on.
+ */
+private void logHeartbeat() {
+    if (settings.logHeartbeat == false) return   // null (never saved) = default on
+    String circleName = showNamesInLogs() ? (state.circles?.find { it.id == settings.circle }?.name ?: settings.circle) : settings.circle
+    log.info("heartbeat - ${circleName}: memberCount:${state.members?.size() ?: 0} ${memberStatusSummary()}")
 }
 
 /**

@@ -92,7 +92,7 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 
 | Variable               | Type    | Set by                                    | Notes                                                                                                                                                            |
 | ---------------------- | ------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lastSuccessMs`        | Long    | `handleMemberLocationResponse` on 200/304 | Watchdog input; triggers warn if stale > `max(pollFreq×10, 10min)`                                                                                               |
+| ~~`lastSuccessMs`~~    | Long    | MEMORY-ONLY (`RUNTIME` map), not in `state` — `markFetchSuccess` | Watchdog input; triggers warn if stale > `max(pollFreq×10, 10min)`                                                                                               |
 | `inTransit-<memberId>` | Boolean | `notifyChildDevice` (echo from driver)    | Per-member in-transit flag (identity-scoped; survives re-auth). Used by `ensureFastChain` to decide whether to seed a fast-poll chain for this member            |
 | `fastChain-<memberId>` | Boolean | `ensureFastChain()`                       | True while a per-member `runIn` fast-poll chain is active. Dropped by `scheduleSlowTimer()` (which calls `unschedule()`) and cleared when a chain ends naturally |
 
@@ -100,8 +100,8 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 
 | Variable            | Type    | Set by                      | Notes                                                                                                                                                                                                                                                                                                              |
 | ------------------- | ------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `memberCount`       | Integer | `handleCirclesPollResponse` | Baseline circle member count from the once-per-minute v4 `/circles` poll; a change triggers `fetchMembers()` (which reconciles child devices and refreshes names/avatars). On first baseline, also triggers an initial `fetchMembers()` if `state.members` is empty. Reset to `null` by `updated()` to re-baseline |
-| `lastCirclesPollMs` | Long    | `handleSlowTimer`           | Throttles the v4 `/circles` membership poll to at most once per `max(pollFreq, 60)` seconds. Reset to `null` by `updated()` so the next tick re-checks membership                                                                                                                                                  |
+| ~~`memberCount`~~   | Integer | removed | Obsolete — v4 `/circles` no longer returns it; the count is `state.members.size()`. Deleted by `removeObsoleteStateKeys()` |
+| ~~`lastMembersPollMs`~~ | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleSlowTimer` | Throttles the periodic `fetchMembers(true)` roster refresh to at most once per `max(pollFreq, 900)` seconds (60s while no roster). Stamped by `updated()` (Done), cleared by `initialize()` |
 
 ### UI one-shot status (button results)
 
@@ -129,7 +129,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 
 | Handler                   | Schedule                                                           | Set by                                   | Purpose                                                                                                                                                                                                                                                                    |
 | ------------------------- | ------------------------------------------------------------------ | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `handleSlowTimer`         | `0/<baseSecs> * * * * ? *` (sub-minute) or `0 */<min> * * * ? *`   | `scheduleSlowTimer()`                    | Each tick: run the stale-data watchdog, poll v4 `/circles` at most once per `max(pollFreq, 60)` seconds to detect membership changes (via the `memberCount` diff → `fetchMembers()`), then either probe `/users/me` (when `tokenLikelyExpired`) or call `fetchLocations()` |
+| `handleSlowTimer`         | `0/<baseSecs> * * * * ? *` (sub-minute) or `0 */<min> * * * ? *`   | `scheduleSlowTimer()`                    | Each tick: run the stale-data watchdog, refresh the roster (`fetchMembers(true)`) at most once per `max(pollFreq, 900)` seconds to detect membership changes (member-id diff), then either probe `/users/me` (when `tokenLikelyExpired`) or call `fetchLocations()` |
 | `fastPollMember`          | one-shot `runIn(<dynamicPollFreq>s)`, self-rescheduling per member | `ensureFastChain()` / `fastPollMember()` | Per-member fast-poll chain; fires extra location fetches for in-transit members while dynamic polling is enabled. Chain ends when the member stops moving, is deselected, or `scheduleSlowTimer()` is called                                                               |
 | `sendTokenExpiryReminder` | one-shot `runIn(<notifyRepeatHours>h)`, self-rescheduling          | `scheduleTokenExpiryReminder()`          | Repeats the token-expiry notification while `tokenLikelyExpired` stays true; chain stops once the token is refreshed or `notifyRepeatHours = never`                                                                                                                        |
 
@@ -193,11 +193,11 @@ Set from `generatePresenceEvent`, mostly via `sendChanged` (sends only when the 
 | `address1`           | string        | Current place/address (`"Home"` when inside HOME radius; `"No Data"` if missing) |
 | `address1prev`       | string        | Previous value of `address1` when it changes                                     |
 | `lastLocationUpdate` | date          | When `address1` last changed (NOT every poll)                                    |
-| `lastUpdated`        | date          | When this driver event batch last ran (every poll that reaches the driver)       |
+| `lastUpdated`        | date          | When this driver event batch last ran (every 200 poll that reaches the driver; 304s skip it) |
 | `since`              | number        | Epoch seconds — Life360's "at current address since" timestamp                   |
 | `status`             | string        | `"At Home"` or `"<x.x> miles from Home"`                                         |
 | `distance`           | number        | Distance from HOME in user units (mi/km)                                         |
-| `savedPlaces`        | string (JSON) | All Life360 places in the circle                                                 |
+| `savedPlaces`        | string (JSON) | Declared but never emitted (the app no longer passes places to the driver)       |
 | `history`            | string        | Compact encoded location history (when `saveHistory` is true). Format: `"1       | s,lat,lng | ds,dlat,dlng | …"`— first entry absolute, rest are signed deltas in units of`0.00001°`. Capped at 1024 chars. GPS jitter (<5m) suppressed. |
 
 ### Motion / driving

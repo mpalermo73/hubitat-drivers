@@ -132,12 +132,12 @@ preferences {
 
 // -- presence sensor commands --
 def arrived() {
-    LAST_SENT.remove(device.id as String)  // manual override: let the next poll resend
+    LAST_SENT[device.id as String]?.remove("presence")  // manual override: let the next poll resend
     sendEvent(name: "presence", value: "present")
 }
 
 def departed() {
-    LAST_SENT.remove(device.id as String)
+    LAST_SENT[device.id as String]?.remove("presence")
     sendEvent(name: "presence", value: "not present")
 }
 
@@ -456,8 +456,21 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
 private void sendChanged(String name, value, String descriptionText = null) {
     Map last = LAST_SENT[device.id as String]
     if (last == null) { last = new java.util.concurrent.ConcurrentHashMap(); LAST_SENT[device.id as String] = last }
-    if (value != null && last[name] == value) return
-    if (value == null) last.remove(name) else last[name] = value
+    String nullKey = name + "?"
+    if (value == null) {   // clear a stale value once per cache lifetime; don't repeat it every poll
+        last.remove(name)
+        Object seen = last.putIfAbsent(nullKey, 1)
+        if (seen == null) {
+            if (device.currentValue(name) != null) sendEvent(name: name, value: null)
+        } else if (seen == 1 && device.currentValue(name) != null) {
+            last[nullKey] = 2   // warn once: the hub did not honor a null event, so the old value is still showing
+            log.warn "sendChanged: sendEvent(null) did not clear '${name}' (still '${device.currentValue(name)}')"
+        }
+        return
+    }
+    last.remove(nullKey)
+    if (last[name] == value) return
+    last[name] = value
     if (descriptionText) sendEvent(name: name, value: value, descriptionText: descriptionText)
     else sendEvent(name: name, value: value)
 }
