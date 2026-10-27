@@ -68,7 +68,7 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 | ------------- | ------ | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `circles`     | List   | `fetchCircles()`              | Response from `/v4/circles` for the circle picker                                                                                                                                                                                                                                              |
 | `places`      | List   | `fetchPlaces()`               | Response from `/v3/circles/<id>/places` for the HOME picker                                                                                                                                                                                                                                    |
-| `members`     | List   | `fetchMembers()`              | **Trimmed** — stores only `[id, firstName, lastName, issues.disconnected]` per member (not the full API response). A successful fetch also runs `syncChildDevices()` (create new / remove orphaned) and pushes refreshed location to existing devices using the untrimmed `rawMembers` objects |
+| `members`     | List   | `fetchMembers()`              | **Trimmed** — stores only `[id, firstName, lastName, issues.disconnected]` per member, sorted by id (null names become `""`, null `disconnected` becomes `false`) (not the full API response). A Fetch Members fetch also runs `syncChildDevices()` (create devices for selected members, remove devices for deselected ones) and pushes refreshed location to existing devices using the untrimmed `rawMembers` objects; Done runs `syncChildDevices()` without the location push; a periodic refresh runs it only when the member ids changed and pushes nothing |
 | `accessToken` | String | `createAccessToken()` (OAuth) | Token used for the `/view` map endpoint URL                                                                                                                                                                                                                                                    |
 
 ---
@@ -85,7 +85,6 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 | ----------------------------- | --------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `cookies`                     | String          | `captureCookies` / `captureCookiesAsync` (via `mergeCookie`)                                         | `clearSessionCache()` (auth errors)                    | `Cookie` header value (`__cf_bm` + `_cfuvid`) sent on subsequent requests. Merged by name so a rotating `__cf_bm` never drops `_cfuvid` |
 | `etag-<memberId>`             | String          | `handleMemberLocationResponse` on 200 OK                                                             | `clearSessionCache()`                                  | Per-member `If-None-Match` value for 304-not-modified responses                                                                         |
-| `inflight-<memberId>`         | Long (epoch ms) | `fetchMemberLocation` before `asynchttpGet`                                                          | `handleMemberLocationResponse` / `clearSessionCache()` | In-flight marker; prevents async-HTTP pile-up                                                                                           |
 | `transientCount-<memberId>`   | Integer         | `handleMemberLocationResponse` on 5xx (502/503/504/520/522/525) or a network-level error (no status) | 200/304 success, `clearSessionCache()`                 | Consecutive-transient-error streak; drives exponential backoff (shift exponent capped at 6 to avoid `long` overflow)                    |
 | `transientUntilMs-<memberId>` | Long (epoch ms) | `handleMemberLocationResponse` on 5xx or network error                                               | 200/304 success, `clearSessionCache()`                 | Skip this member's fetch until this time (capped 300s backoff)                                                                          |
 
@@ -93,7 +92,8 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 
 | Variable               | Type    | Set by                                    | Notes                                                                                                                                                            |
 | ---------------------- | ------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lastSuccessMs`        | Long    | `handleMemberLocationResponse` on 200/304 | Watchdog input; triggers warn if stale > `max(pollFreq×10, 10min)`                                                                                               |
+| ~~`lastSuccessMs`~~    | Long    | MEMORY-ONLY (`RUNTIME` map), not in `state` — `markFetchSuccess` | Watchdog input; triggers warn if stale > `max(pollFreq×10, 10min)`; cleared by `resetWatchdog()`                                                                                               |
+| ~~`watchdogStartMs`~~  | Long    | MEMORY-ONLY (`RUNTIME` map) — `handleSlowTimer` | Watchdog clock before the first success; cleared by `resetWatchdog()` (Done, reboot, token recovery, nothing configured) |
 | `inTransit-<memberId>` | Boolean | `notifyChildDevice` (echo from driver)    | Per-member in-transit flag (identity-scoped; survives re-auth). Used by `ensureFastChain` to decide whether to seed a fast-poll chain for this member            |
 | `fastChain-<memberId>` | Boolean | `ensureFastChain()`                       | True while a per-member `runIn` fast-poll chain is active. Dropped by `scheduleSlowTimer()` (which calls `unschedule()`) and cleared when a chain ends naturally |
 
@@ -101,8 +101,8 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 
 | Variable            | Type    | Set by                      | Notes                                                                                                                                                                                                                                                                                                              |
 | ------------------- | ------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `memberCount`       | Integer | `handleCirclesPollResponse` | Baseline circle member count from the once-per-minute v4 `/circles` poll; a change triggers `fetchMembers()` (which reconciles child devices and refreshes names/avatars). On first baseline, also triggers an initial `fetchMembers()` if `state.members` is empty. Reset to `null` by `updated()` to re-baseline |
-| `lastCirclesPollMs` | Long    | `handleSlowTimer`           | Throttles the v4 `/circles` membership poll to at most once per `max(pollFreq, 60)` seconds. Reset to `null` by `updated()` so the next tick re-checks membership                                                                                                                                                  |
+| ~~`memberCount`~~   | Integer | removed | Obsolete — v4 `/circles` no longer returns it; the count is `state.members.size()`. Deleted by `removeObsoleteStateKeys()` |
+| ~~`lastMembersPollMs`~~ | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleSlowTimer` | Throttles the periodic `fetchMembers(true)` roster refresh to at most once per `max(pollFreq, 900)` seconds (~5 min while no roster). Stamped by `updated()` (Done), cleared by `initialize()` |
 
 ### UI one-shot status (button results)
 
@@ -120,8 +120,8 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 | `failCount`          | Integer | `handleException` / `handleMemberLocationResponse` on 401/403    | 200-OK response, `updated()`                                   | Auth-failure streak; triggers `tokenLikelyExpired` at ≥3                                                                                                                                                                                                                                    |
 | `tokenLikelyExpired` | Boolean | `handleException` / `handleMemberLocationResponse` on 401/403 ×3 | `handleTokenProbeResponse` on 200 (auto-recovery), `updated()` | When true, normal polling is short-circuited and slowed to 5 min. Each 5-min tick fires `probeTokenAfterExpiry()` (async `GET /users/me`); a 200 response auto-recovers — clears this flag, resets `failCount`, restores normal polling. A 401/403 probe stays quiet and retries next tick. |
 | `rateLimitedUntilMs` | Long    | `handleException` / `handleMemberLocationResponse` on 429        | 200-OK response, `updated()`                                   | Honors `Retry-After`; polling skipped until this time                                                                                                                                                                                                                                       |
-| `watchdogWarned`     | Boolean | `handleSlowTimer` watchdog (rising edge)                         | 200/304 success                                                | Prevents the "no successful update" warning from spamming every tick                                                                                                                                                                                                                        |
-| `message`            | String  | various error paths                                              | 200-OK success / `updated()` / no-arg `initialize()`           | Red banner shown on the app's main page                                                                                                                                                                                                                                                     |
+| `watchdogWarned`     | Boolean | `handleSlowTimer` watchdog (rising edge)                         | 200/304 success, `resetWatchdog()`                                                | Prevents the "no successful update" warning from spamming every tick                                                                                                                                                                                                                        |
+| `message`            | String  | various error paths                                              | `markFetchSuccess`, `fetchCircles`/`fetchPlaces` 200, non-periodic `fetchMembers` 200, token probe 200, `updated()`, `resetWatchdog()` (clears only a `WATCHDOG...` banner: Done, reboot, token recovery, nothing configured); the periodic roster refresh never touches it | Red banner shown on the app's main page                                                                                                                                                                                                                                                     |
 | `placesEmptyWarned`  | Boolean | `notifyChildDevice` (rising edge)                                | `fetchPlaces()` success                                        | Prevents the "state.places is empty" error from spamming every tick while places are missing                                                                                                                                                                                                |
 
 ---
@@ -130,7 +130,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 
 | Handler                   | Schedule                                                           | Set by                                   | Purpose                                                                                                                                                                                                                                                                    |
 | ------------------------- | ------------------------------------------------------------------ | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `handleSlowTimer`         | `0/<baseSecs> * * * * ? *` (sub-minute) or `0 */<min> * * * ? *`   | `scheduleSlowTimer()`                    | Each tick: run the stale-data watchdog, poll v4 `/circles` at most once per `max(pollFreq, 60)` seconds to detect membership changes (via the `memberCount` diff → `fetchMembers()`), then either probe `/users/me` (when `tokenLikelyExpired`) or call `fetchLocations()` |
+| `handleSlowTimer`         | `0/<baseSecs> * * * * ? *` (sub-minute) or `0 */<min> * * * ? *`   | `scheduleSlowTimer()`                    | Each tick: run the stale-data watchdog, refresh the roster (`fetchMembers(true)`) at most once per `max(pollFreq, 900)` seconds to detect membership changes (member-id diff), then either probe `/users/me` (when `tokenLikelyExpired`) or call `fetchLocations()` |
 | `fastPollMember`          | one-shot `runIn(<dynamicPollFreq>s)`, self-rescheduling per member | `ensureFastChain()` / `fastPollMember()` | Per-member fast-poll chain; fires extra location fetches for in-transit members while dynamic polling is enabled. Chain ends when the member stops moving, is deselected, or `scheduleSlowTimer()` is called                                                               |
 | `sendTokenExpiryReminder` | one-shot `runIn(<notifyRepeatHours>h)`, self-rescheduling          | `scheduleTokenExpiryReminder()`          | Repeats the token-expiry notification while `tokenLikelyExpired` stays true; chain stops once the token is refreshed or `notifyRepeatHours = never`                                                                                                                        |
 
@@ -142,7 +142,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 
 | Source               | Event         | Handler                                                                                                                   |
 | -------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `location` (Hubitat) | `systemStart` | `initialize` — calls `clearSessionCache()` (clears in-flight keys left from before the restart) then re-schedules polling |
+| `location` (Hubitat) | `systemStart` | `initialize` — calls `clearSessionCache()` (drops session caches left from before the restart; in-flight markers live in memory and are already gone) then re-schedules polling |
 
 ---
 
@@ -171,7 +171,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 
 ## Driver: Attributes (per child device)
 
-Set via `sendEvent` from `generatePresenceEvent`. Read via `device.currentValue("<name>")` or in Rule Machine.
+Set from `generatePresenceEvent`, mostly via `sendChanged` (sends only when the value changed). Read via `device.currentValue("<name>")` or in Rule Machine.
 
 ### Capabilities (standard Hubitat)
 
@@ -194,11 +194,11 @@ Set via `sendEvent` from `generatePresenceEvent`. Read via `device.currentValue(
 | `address1`           | string        | Current place/address (`"Home"` when inside HOME radius; `"No Data"` if missing) |
 | `address1prev`       | string        | Previous value of `address1` when it changes                                     |
 | `lastLocationUpdate` | date          | When `address1` last changed (NOT every poll)                                    |
-| `lastUpdated`        | date          | When this driver event batch last ran (every poll that reaches the driver)       |
+| `lastUpdated`        | date          | When this driver event batch last ran (every 200 poll that reaches the driver; 304s skip it) |
 | `since`              | number        | Epoch seconds — Life360's "at current address since" timestamp                   |
 | `status`             | string        | `"At Home"` or `"<x.x> miles from Home"`                                         |
 | `distance`           | number        | Distance from HOME in user units (mi/km)                                         |
-| `savedPlaces`        | string (JSON) | All Life360 places in the circle                                                 |
+| `savedPlaces`        | string (JSON) | Declared but never emitted (the app no longer passes places to the driver)       |
 | `history`            | string        | Compact encoded location history (when `saveHistory` is true). Format: `"1       | s,lat,lng | ds,dlat,dlng | …"`— first entry absolute, rest are signed deltas in units of`0.00001°`. Capped at 1024 chars. GPS jitter (<5m) suppressed. |
 
 ### Motion / driving
@@ -208,7 +208,7 @@ Set via `sendEvent` from `generatePresenceEvent`. Read via `device.currentValue(
 | `inTransit`    | enum `true`/`false` | From Life360, optionally overridden by `transitThreshold`                                                                                                                                               |
 | `isDriving`    | enum `true`/`false` | From Life360, optionally overridden by `drivingThreshold`                                                                                                                                               |
 | `speed`        | number              | Current speed in user units (mph/kph)                                                                                                                                                                   |
-| `userActivity` | string              | Life360 activity hint (`unknown`/`biking`/`running`/`vehicle`); the `os_` prefix is stripped. Emitted every poll, but the value is only meaningful when the API payload includes it (often blank on V3) |
+| `userActivity` | string              | Life360 activity hint (`unknown`/`biking`/`running`/`vehicle`); the `os_` prefix is stripped. Emitted when changed; `unknown` when Life360 sends none. The value is only meaningful when the API payload includes it (often blank on V3) |
 
 ### Phone / connectivity
 
