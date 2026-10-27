@@ -24,11 +24,14 @@
 
 - **Driver sends events only when a value changed** (was: every attribute on every update). `lastUpdated` and the dashboard tile (when HTML Fields is on) still send on every poll that reaches the driver — intentional, so they keep showing liveness. When Life360 sends no `userActivity`, the driver now reports Life360's own `unknown` instead of an empty value. Note: the hub already filters events whose value did not change, so this mainly saves the per-call overhead, not stored events.
 - **Fewer state writes in the app:** in-flight markers, the last-success time and the roster-refresh time are kept in memory instead of `state`; unchanged etag/cookie/roster values are no longer rewritten.
-- **The per-minute v4 `/circles` poll is gone.** The member roster (`/members`) is re-read at most every 15 minutes instead (and immediately when you press Done); it picks up joins and leaves (devices are reconciled; no locations are pushed from the routine refresh). v4 `/circles` is only used by the setup picker, since it no longer returns `memberCount`.
+- **The per-minute v4 `/circles` poll is gone.** The member roster (`/members`) is re-read at most every 15 minutes instead (and immediately when you press Done; about every 5 minutes while no roster has loaded yet); it picks up joins and leaves (devices are reconciled; no locations are pushed from the routine refresh). v4 `/circles` is only used by the setup picker, since it no longer returns `memberCount`.
 - **Heartbeat log is now once per roster refresh (~15 min) instead of every poll,** and there is a new **Heartbeat Logging** setting (default on) to turn it off.
 - **Watchdog fixes:** it restarts after a reboot, Done or token recovery, no longer fires when nothing is configured, and a routine roster refresh no longer erases a watchdog or error banner.
 - A roster response with no member list no longer wipes the saved roster (Done / Fetch Members shows a banner), and a deleted circle (HTTP 404 from `/members`) now logs "circle not found" and, on Done / Fetch Members, shows a banner telling you to reselect the circle.
-- With several phone numbers or emails on a member, the driver now uses the first of each instead of flipping between them every update.
+- With several phone numbers or emails on a member, the driver now settles on the last of each (as before) instead of re-sending each one on every update. A speed below zero (the phone has no reading) counts as zero.
+- **A phone that has stopped no longer holds fast polling on.** Life360 can keep `inTransit` / `isDriving` (and even the last speed) set for a phone that is sitting still, which kept the faster Dynamic Polling rate running indefinitely. If a member Life360 calls in transit has not left the spot where it was first seen (beyond the phone's own reported accuracy) for longer than two default refresh cycles, and at least 2 minutes, the driver now tells the app to stop fast polling. The `inTransit` / `isDriving` attributes still show exactly what Life360 reports; any real movement restarts the timer, and the rule is skipped when a Minimum 'Transit' / 'Driving' Speed is set on the device.
+- The routine slow poll skips a member who was fast-polled a moment ago, instead of requesting them twice. Manual fetches still poll everyone.
+- With "Include Names and Places in Logs" off, the driver's debug lines hide coordinates and addresses.
 - The driver drops its last-sent cache when the device is removed or when you press arrived/departed (presence only).
 - The unused places data is no longer built or passed to the driver.
 
@@ -70,7 +73,7 @@ Significant update from the 5.1.3 / 5.1.4 baseline. Core theme: **the integratio
 - **Check Token** — validates your access token with an inline success/failure result on the settings page, including a "Hi, name!" confirmation. Also re-reads the account's units preference.
 - **Units auto-detected** — speed and distance follow your Life360 account's imperial/metric preference, fetched automatically from `/users/me`. The per-device `unitOverride` setting is a fallback only (old `isMiles` bool is migrated automatically).
 - **Dynamic polling reacts immediately** — when a member starts or stops moving, the polling rate switches on the same tick instead of lagging a full cycle.
-- **Membership auto-sync** — the member roster is re-read at most every 15 min (and immediately on Done); when the set of members changes, child devices are reconciled (new members get a device, departed members' devices are removed) and existing devices get refreshed names/avatars — no need to reopen the app.
+- **Membership auto-sync** — the member roster is re-read at most every 15 min (and immediately on Done); when the set of members changes, child devices are reconciled (new members get a device, devices for deselected members are removed) and existing devices get refreshed names/avatars — no need to reopen the app.
 
 ### Settings page
 

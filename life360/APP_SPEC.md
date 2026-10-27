@@ -111,7 +111,7 @@ cookie).
    `GET /circles/{id}/members/{mid}` carrying that member's `If-None-Match`. An unchanged member
    returns a near-free `304`; only movers return a `200` body. A **separate, slow** v3
    `GET /circles/{id}/members` refresh (≤1 per 15 min) re-reads the roster and compares member ids;
-   a change triggers a device reconcile and name/avatar push (§4.2).
+   a change in who is in the circle triggers a device reconcile (§4.2). Locations are never pushed from the periodic refresh.
 2. **Async, with a per-member in-flight guard.** Every per-member fetch is `asynchttpGet`, so a
    slow/down Life360 never blocks the hub scheduler thread. A per-member in-flight marker prevents a
    second request for a member whose prior request is still outstanding — a slow service skips that
@@ -151,8 +151,8 @@ cookie).
 │   •     handleMemberLocationResponse: 200 → update child; 304 → noop  │
 │   •     200 + in-transit → ensureFastChain() (§4.3, if dynamic on)   │
 │   •   fetchMembers(periodic): member-id diff → full sync if changed  │
-│   •     handleMembersResponse: refresh state.members + reconcile      │
-│   •       child devices (create/remove) + push name/avatar/location   │
+│   •     handleMembersResponse: refresh state.members; reconcile      │
+│   •       child devices (on Done / Fetch Members / id change)         │
 │   • fastPollMember(): per-member runIn chain for movers (§4.3)       │
 │   • forceMemberUpdate(memberId): POST …/request  (manual button)     │
 │   • /view endpoint: all-members map (OSM default, Google optional)   │
@@ -182,7 +182,7 @@ Base path `https://api-cloudfront.life360.com/v{version}`.
 | ------------------------------ | ------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Poll one member's location** | `GET /circles/{circle}/members/{member}`          | 3       | **Core location call.** Per member, with that member's `If-None-Match`. `200` = changed (full member + `location`); `304` = unchanged (near-free). One per selected member per tick.             |
 | **Detect roster changes**      | `GET /circles/{circle}/members`                   | 3       | **Slow cadence (≤1 per 15 min, ~5 min while no roster).** Same call as below, flagged `periodic`: if the member-id set is unchanged it only refreshes `state.members` (when different) and logs the optional heartbeat. v4 `/circles` is no longer polled — it does not return `memberCount`. |
-| **Refresh membership / names** | `GET /circles/{circle}/members`                   | 3       | `fetchMembers()`: on **Done** (`updated()`), the **Fetch Members** button, or a periodic refresh that finds the roster changed. Refreshes `state.members`, reconciles child devices, pushes refreshed name/avatar/location.                            |
+| **Refresh membership / names** | `GET /circles/{circle}/members`                   | 3       | `fetchMembers()`: on **Done** (`updated()`), the **Fetch Members** button, or a periodic refresh. Done / Fetch Members refresh `state.members`, reconcile child devices and push name/avatar/location; the periodic refresh refreshes `state.members` and reconciles devices only when member ids changed (no location push).                            |
 | Force fresh GPS fix            | `POST /circles/{circle}/members/{member}/request` | 3       | Body `{"type":"location"}`, `Content-Type: application/json`. Returns `{requestId, isPollable}`. Cookies required (Cloudflare).                                                                  |
 
 ### 3.2 Setup / on demand
@@ -259,8 +259,10 @@ Notes to keep alongside the steps:
 
 `handleSlowTimer` is the single scheduled handler. Each tick, in order:
 
-1. **Watchdog** — if `lastSuccessMs` is older than `max(pollFreq×10, 10min)` and the token isn't
-   flagged, log `WATCHDOG` once on the rising edge (`state.watchdogWarned`) and set a banner.
+1. **Watchdog** — the base is `lastSuccessMs`, or `watchdogStartMs` until the first success. If it is older than
+   `max(pollFreq×10, 10min)` and the token isn't flagged, log `WATCHDOG` once on the rising edge
+   (`state.watchdogWarned`) and set a banner. `resetWatchdog()` clears both clocks and the warning on Done,
+   reboot, token recovery, or when no circle/members are configured (it also clears a `WATCHDOG` banner).
 2. **Roster refresh** — at most once per 15 minutes (`MEMBERS_REFRESH_SECS`, memory-only `lastMembersPollMs`; ~5 min while
    `state.members` is empty; skipped while the token is flagged, rate-limited, or unset), call `fetchMembers(true)` (§4.2).
 3. **Locations** — if `tokenLikelyExpired`, fire `probeTokenAfterExpiry()` (§5) and return; otherwise
@@ -327,7 +329,7 @@ Notes:
   every member) and thread it through every `fetchMemberLocation` → `notifyChildDevice` (§4.5). The
   driver only uses `home`, so the full places list is no longer serialized or passed.
 - **`markFetchSuccess(memberId)`** clears `failCount`, `tokenLikelyExpired`, `rateLimitedUntilMs`,
-  `message`, `watchdogWarned`, `lastSuccessMs`, and that member's transient backoff state. Each write is
+  `message`, `watchdogWarned`, and that member's transient backoff state, and stamps `lastSuccessMs`. Each write is
   skipped when it would change nothing (state writes are costly on Hubitat); `lastSuccessMs` is memory-only (`RUNTIME` map), so a steady-state poll writes no state. After a reboot the watchdog clock
   (`watchdogStartMs`, set on the first tick once a circle and members are selected) stands in until the first success.
 
@@ -337,8 +339,8 @@ Notes:
 # in handleSlowTimer, rate-limited to ≤once/15 min via memory-only lastMembersPollMs
 fetchMembers(periodic=true)
 
-fetchMembers(periodic = false):                   # async GET /circles/{id}/members (v3)
-  asynchttpGet("handleMembersResponse", life360Params("/circles/${circle}/members"), [periodic: periodic])
+fetchMembers(periodic = false, pushLocations = true):  # async GET /circles/{id}/members (v3)
+  asynchttpGet("handleMembersResponse", life360Params("/circles/${circle}/members"), [periodic: periodic, push: pushLocations])
 
 handleMembersResponse(response):
   if !status: log + return
@@ -348,16 +350,16 @@ handleMembersResponse(response):
     # trim to fields the app needs — keeps state.members small so every exec's deserialize is cheap
     newMembers = rawMembers.collect { [id, firstName, lastName, issues.disconnected] }
     rosterChanged = ids(newMembers) != ids(state.members)
-    detailsChanged = newMembers != state.members  # names / connected flag
-    if newMembers != state.members: state.members = newMembers   # skip no-op state write
+    if newMembers != state.members: state.members = newMembers   # skip no-op state write (also picks up name / connected-flag changes)
     if periodic: logHeartbeat()                   # only if logHeartbeat setting is on
-    if periodic AND NOT rosterChanged AND NOT detailsChanged: return   # routine refresh, nothing different
+    if periodic: (syncChildDevices() if rosterChanged); return   # routine refresh: never push /members locations (may be older than the per-member poll)
     syncChildDevices()                            # create new / remove orphaned (§4.4)
-    for memberId in settings.users:               # push refreshed name/avatar/location
+    if push (Fetch Members only; Done and periodic skip it):
+      for memberId in settings.users:             # push refreshed name/avatar/location
       m = rawMembers.find { it.id == memberId }   # use rawMembers (untrimmed) for location push
       if m?.location: notifyChildDevice(memberId, m)
-  elif status in (401, 403): log; if !periodic: banner "AUTH error"
-  elif status == 404: log "circle not found"; if !periodic: banner "circle not found — re-open Life360+ and select a valid circle"
+  elif status in (401, 403): log; if !periodic: banner "access denied — re-paste the token (STEP 1) or re-select the circle (STEP 2)"   # 403 may mean the circle is gone
+  elif status == 404: log "circle not found"; if !periodic: banner "circle not found — open Life360+ and re-select the circle (STEP 2)"
   else: log; if !periodic: banner "bad response"
 ```
 
@@ -369,8 +371,9 @@ setting is on (default on — about 96 lines/day at the 15-minute cadence; turn 
 is the dead-poll signal either way.
 
 This is the integration's membership auto-sync: when the roster's member ids change, devices are reconciled
-and existing devices get refreshed identity/location — without the user reopening the app. A refresh that
-finds the same roster does no sync and no device push.
+without the user reopening the app. The routine refresh never pushes `/members` locations to devices (they can be
+older than the per-member poll's); names and avatars update on the member's next location update, or on Done /
+Fetch Members, which do push.
 
 **On demand.** `updated()` (the Done button) calls `fetchMembers()` immediately (when a circle and token are set) and stamps `lastMembersPollMs`,
 so a roster change shows up right away. `initialize()` (hub reboot) clears `lastMembersPollMs` so the first tick refreshes.
@@ -379,8 +382,10 @@ so a roster change shows up right away. `initialize()` (hub reboot) clears `last
 
 When `dynamicPolling` is enabled and the dynamic rate is faster than the default rate, in-transit
 members get **extra polling via per-member `runIn` chains** rather than a global rate switch.
-The slow timer continues to fire all members at `pollFreq`; movers additionally receive individual
-ticks at `dynamicPollFreq` via these chains running in parallel.
+The slow timer fires members at `pollFreq`, except a member whose fast chain already polled them within two
+`dynamicPollFreq` intervals (memory-only `lastFetch-<id>`): that mover is skipped on the slow tick, so they are not
+requested twice in the same moment. If the chain ever dies the recent-fetch time ages out and the slow tick polls
+them again. Manual fetches (Fetch Locations, refresh, Force Update) still poll every member.
 
 ```
 ensureFastChain(memberId):
@@ -425,7 +430,7 @@ fastPollMember(data):
 ### 4.4 Child-device reconciliation — `createChildDevices()` and `syncChildDevices()`
 
 `syncChildDevices()` is the top-level entry point, called from `installed()`, `updated()`,
-`initialize()`, and `handleMembersResponse` (on a 200). It:
+`initialize()`, and `handleMembersResponse` (on a Done / Fetch Members 200, or a periodic 200 whose member ids changed). It:
 
 1. Calls `createChildDevices()` — creates devices for any selected member that doesn't have one yet.
    Returns a `dni → device` map hoisted from `getChildDevices()` (avoids an O(N²) hub device-list
@@ -524,7 +529,7 @@ the callback; it is memory-only, not `state`; `fetchMemberLocation` skips a memb
 (`TIMEOUT`/`AUTH`/`RATE_LIMIT`/`TRANSIENT`/`OTHER`) and applies the same account-level state updates;
 used by the synchronous setup calls (`fetchCircles`, `fetchPlaces`).
 
-**Watchdog.** `lastSuccessMs` is the newest success across all members. If it's older than
+**Watchdog.** `lastSuccessMs` (or `watchdogStartMs` before the first success) is the newest success across all members. If it's older than
 `max(pollFreq×10, 10min)` and the token isn't flagged, log `WATCHDOG` once on the rising edge and set a
 banner; both clear on the next success.
 
@@ -663,7 +668,7 @@ preference; it was replaced by `unitOverride` (an `enum`) with a one-time migrat
 settings vocabulary (§9/§10).
 
 **Where improvement is allowed (behind the contract):** add new attributes/commands (purely additive);
-change _how_ a value is computed or _how often_ it's sent (Hubitat dedupes by value); alias a
+change _how_ a value is computed or _how often_ it's sent (the driver's `sendChanged` skips unchanged values); alias a
 badly-named legacy attribute with a clearer new one **in addition to** — never instead of — the legacy
 one.
 
@@ -750,8 +755,9 @@ into forum posts.
 | `logRawPayload`   | bool | OFF     | **Verbosity + sensitive.** Raw payloads, partial token, partial cookie head, GPS — the full firehose. Labeled sensitive; warn not to share. |
 | `logShowNames`    | bool | ON      | **PII redaction.** ON = names; OFF = opaque UUIDs everywhere (app `getShowNamesInLogs()` + driver `displayMember()`).                       |
 | `logShowMapsLink` | bool | ON      | **PII redaction.** ON = "moving" log includes a Maps link to exact coords; OFF = link (and coords) omitted.                                 |
+| `logHeartbeat`    | bool | ON      | **Verbosity.** One heartbeat line per routine roster refresh (about every 15 min); none on Done / Fetch Members or while the roster is empty. |
 
-**Upgrade-safe defaults.** All four settings use null-safe comparisons (`!= false` for ON-by-default,
+**Upgrade-safe defaults.** All of these settings use null-safe comparisons (`!= false` for ON-by-default,
 `== true` for OFF-by-default) so that an upgrader who has never opened the app's settings page gets
 the intended defaults without needing to hit Done. `null` (never configured) evaluates the same as
 the documented default.
@@ -800,7 +806,7 @@ To rebuild from nothing, in dependency order:
 5. **Per-member backoff + account gates (§5).** Verify a flaky member backs off alone; 401/429 pause
    the whole loop; auto-recovery probe clears `tokenLikelyExpired` on a 200.
 6. **Slow loop (§4.2):** periodic roster refresh (v3 `/members`, ≤1/15 min) → member-id diff →
-   `handleMembersResponse` → `syncChildDevices` + name/avatar/location push. Confirm the heartbeat log
+   `handleMembersResponse` → `syncChildDevices` (on an id change; Done / Fetch Members also push name/avatar/location). Confirm the heartbeat log
    fires on each roster refresh with `logHeartbeat` on (the default) and is silent with it off.
 7. **Dynamic polling fast chains (§4.3):** `ensureFastChain` / `fastPollMember` / `scheduleSlowTimer`
    chain cleanup. Verify a stopped member's chain ends and the slow poll picks it back up.
