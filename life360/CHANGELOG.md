@@ -1,5 +1,6 @@
 - [Life360+ Changelog](#life360-changelog)
-  - [5.2.4 (testing)](#524-testing)
+  - [5.2.5 (testing)](#525-testing)
+  - [5.2.4](#524)
   - [5.2.3](#523)
   - [5.2.2](#522)
   - [5.2.1](#521)
@@ -17,19 +18,23 @@
 
 # Life360+ Changelog
 
-## 5.2.4 (testing)
+## 5.2.5 (testing)
 
 **Fresh, hub-untested changes — try on a spare/low-risk setup first.** Goal: less I/O on small hubs, minimal functional change.
 
 - **Driver sends events only when a value changed** (was: every attribute on every update). `lastUpdated` and the dashboard tile (when HTML Fields is on) still send on every poll that reaches the driver — intentional, so they keep showing liveness. When Life360 sends no `userActivity`, the driver now reports Life360's own `unknown` instead of an empty value. Note: the hub already filters events whose value did not change, so this mainly saves the per-call overhead, not stored events.
 - **Fewer state writes in the app:** in-flight markers, the last-success time and the roster-refresh time are kept in memory instead of `state`; unchanged etag/cookie/roster values are no longer rewritten.
-- **The per-minute v4 `/circles` poll is gone.** The member roster (`/members`) is re-read at most every 15 minutes instead (and immediately when you press Done); it picks up joins/leaves and name changes. v4 `/circles` is only used by the setup picker, since it no longer returns `memberCount`.
+- **The per-minute v4 `/circles` poll is gone.** The member roster (`/members`) is re-read at most every 15 minutes instead (and immediately when you press Done); it picks up joins and leaves (devices are reconciled; no locations are pushed from the routine refresh). v4 `/circles` is only used by the setup picker, since it no longer returns `memberCount`.
 - **Heartbeat log is now once per roster refresh (~15 min) instead of every poll,** and there is a new **Heartbeat Logging** setting (default on) to turn it off.
 - **Watchdog fixes:** it restarts after a reboot, Done or token recovery, no longer fires when nothing is configured, and a routine roster refresh no longer erases a watchdog or error banner.
 - A roster response with no member list no longer wipes the saved roster (Done / Fetch Members shows a banner), and a deleted circle (HTTP 404 from `/members`) now logs "circle not found" and, on Done / Fetch Members, shows a banner telling you to reselect the circle.
 - With several phone numbers or emails on a member, the driver now uses the first of each instead of flipping between them every update.
 - The driver drops its last-sent cache when the device is removed or when you press arrived/departed (presence only).
 - The unused places data is no longer built or passed to the driver.
+
+## 5.2.4
+
+**HTTP 408 is now treated as a transient error.** Life360 sometimes answers a slow request with 408 Request Timeout, and the next poll succeeds. It used to fall through to the generic error path and log a red `unexpected response:408`. It now gets the same handling as a 5xx: a warning, per-member exponential backoff, and a reset on the next successful fetch.
 
 ## 5.2.3
 
