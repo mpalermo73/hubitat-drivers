@@ -121,8 +121,7 @@ preferences {
     input "generateHtml", "bool", title: "HTML Fields (tile, avatar)", required: true, defaultValue: false
     input "saveHistory", "bool", title: "Save Location History", description: "Save recent locations (time/lat/lng) to 'history' attribute", required: true, defaultValue: false
 
-    input "transitThreshold", "number", title: "Minimum 'Transit' Speed", description: "Set minimum speed for inTransit to be true\n(leave as 0 to use Life360 data)", required: true, defaultValue: 0
-    input "drivingThreshold", "number", title: "Minimum 'Driving' Speed", description: "Set minimum speed for isDriving to be true\n(leave as 0 to use Life360 data)", required: true, defaultValue: 0
+    input "drivingThreshold", "number", title: "Minimum 'Driving' Speed", description: "Speed at which the tile shows 'Driving' instead of 'Moving'\n(0 = never show 'Driving')", required: true, defaultValue: 0
 
     input "avatarFontSize", "number", title: "Avatar Font Size", required: true, defaultValue: 15
     input "avatarSize", "number", title: "Avatar Size by Percentage", required: true, defaultValue: 75
@@ -318,40 +317,26 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     distanceUnits = ((distanceAway / 1000) / (useMiles ? KM_PER_MI : 1)).round(2)
 
     // ── Motion state ─────────────────────────────────────────────────────────────
-    // Trust Life360's inTransit/isDriving flags directly.
-    // Manual thresholds (transitThreshold/drivingThreshold) let the user override
-    // with speed-based logic if they choose — otherwise Life360's values stand.
-    double transitThresholdD = (transitThreshold ?: 0).toDouble()
-    double drivingThresholdD = (drivingThreshold ?: 0).toDouble()
-    boolean thresholdActive = (transitThresholdD > 0.0 || drivingThresholdD > 0.0)
-    if (transitThresholdD > 0.0) {
-        inTransit = (speedUnits >= transitThresholdD)
-    }
-    if (drivingThresholdD > 0.0) {
-        isDriving = (speedUnits >= drivingThresholdD)
-    }
-    // Life360's inTransit/isDriving are reported exactly as received. But Life360 can keep them (and even a stale speed) set after
-    // the phone has stopped sending fixes, and the value we return to the app drives the fast poll rate. That is OUR polling
-    // decision, not Life360's data: the app passes ctx.staleSecs when Life360's etag has not changed (no new fix) for 240 s while it
-    // still says inTransit, and we then tell the app to stop fast polling. Ignored when the user set a Minimum Transit Speed,
-    // which already decides inTransit from speed (the app still sends it).
-    boolean stillTooLong = false
-    if (transitThresholdD <= 0.0 && inTransit && ctx?.staleSecs != null) {
+    // Life360's inTransit/isDriving are reported exactly as received. But Life360 can keep inTransit set after the phone has
+    // stopped sending fixes, and the value we return to the app drives the fast poll rate. The app passes ctx.staleSecs when
+    // Life360's etag has not changed (no new fix) for 240 s while it still says inTransit; isMoving then goes false.
+    double drivingThresholdD = (drivingThreshold ?: 0).toDouble()   // only decides the tile's "Driving" label
+    boolean noNewDataWhileInTransit = false
+    if (inTransit && ctx?.staleSecs != null) {
         if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: no new Life360 data for ${ctx.staleSecs}s with inTransit:true; not fast polling"
-        stillTooLong = true
+        noNewDataWhileInTransit = true
     }
 
     String suffix = showMapsLink ? " — <a href='https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}' target='_blank'>Google Maps link</a>" : ""
-    boolean moving = inTransit || isDriving
     // isMoving = Life360 says in transit AND it has not gone quiet for too long (the same value the app uses
     // to decide on fast polling). The first poll after an upgrade has no stored isMoving, so fall back to inTransit.
-    boolean isMovingNow = inTransit && !stillTooLong
+    boolean isMovingNow = inTransit && !noNewDataWhileInTransit
     boolean prevIsMoving = (device.currentValue('isMoving') != null) ? (device.currentValue('isMoving') == 'true') : prevInTransit
-    if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: ${showNames ? "lat:$latitude lng:$longitude" : "location hidden (names off)"} acc:${accuracy}m b:${battery}% wifi:$wifiState speed:${speed.round(2)}m/s inTransit:$inTransit isDriving:$isDriving isMoving:$isMovingNow"
+    String sStatus = (memberPresence == "present") ? "At Home" : sprintf("%.1f", distanceUnits) + ((useMiles) ? " miles from Home" : " km from Home")
+    if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: ${showNames ? "lat:$latitude lng:$longitude" : "location hidden (names off)"} acc:${accuracy}m b:${battery}% wifi:$wifiState status:$sStatus speed:${speedUnits}${useMiles ? 'mph' : 'kph'}${drivingThresholdD > 0.0 ? " drivingThreshold:$drivingThreshold" : ""} inTransit:$inTransit isDriving:$isDriving isMoving:$isMovingNow"
     if (logEachPoll) {
-        // default on: log every poll when moving — but not while stationary (Life360 keeps
-        // inTransit/isDriving set at a light, in traffic, or for a while after arriving)
-        if (moving && !stillTooLong && speedUnits >= 1.0) {
+        // default on: log every poll while moving, but not at a light or in traffic
+        if (isMovingNow && speedUnits >= 1.0) {
             log.info("${displayMember(memberFirstName, showNames)}: moving @ ${speedUnits} ${useMiles ? 'mph' : 'kph'}${suffix}")
         }
     } else {
@@ -361,15 +346,6 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
         } else if (!isMovingNow && prevIsMoving) {
             log.info("${displayMember(memberFirstName, showNames)}: stopped moving${suffix}")
         }
-    }
-    // extra debug detail only when debug logging is on
-    if (thresholdActive && logEnable) log.debug("MOTION ${displayMember(memberFirstName, showNames)}: " +
-        "speedUnits:${speedUnits} inTransit:${inTransit} isDriving:${isDriving} isMoving:${isMovingNow} (threshold override)")
-
-    String sStatus = (memberPresence == "present") ? "At Home" : sprintf("%.1f", distanceUnits) + ((useMiles) ? " miles from Home" : " km from Home")
-
-    if (logEnable && (isDriving || inTransit)) {
-        log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: $sStatus, speedUnits:$speedUnits, transitThreshold:$transitThreshold, inTransit:$inTransit, drivingThreshold:$drivingThreshold, isDriving:$isDriving, isMoving:$isMovingNow"
     }
 
     sendEvent(name: "status", value: sStatus)
@@ -381,9 +357,8 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     sendEvent(name: "distance", value: distanceUnits)
     sendEvent(name: "userActivity", value: userActivity)
 
-    // Set acceleration to active state if we are either moving or if we are anywhere outside home radius
-    // REPURPOSED CAPABILITY: 'acceleration' active/inactive = in transit OR driving OR away from home (NOT physical acceleration)
-    sendEvent(name: "acceleration", value: (inTransit || isDriving || memberPresence == "not present") ? "active" : "inactive")
+    // REPURPOSED CAPABILITY: 'acceleration' active/inactive = isMoving OR away from home (NOT physical acceleration)
+    sendEvent(name: "acceleration", value: (isMovingNow || memberPresence == "not present") ? "active" : "inactive")
 
     // *** Battery Level ***
     sendEvent(name: "battery", value: battery)
@@ -431,7 +406,7 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     if (avatarHtml != device.currentValue("avatarHtml")) sendEvent(name: "avatarHtml", value: avatarHtml)
 
     String motionLabel
-    if (isDriving && isMovingNow) motionLabel = "Driving"
+    if (isMovingNow && drivingThresholdD > 0.0 && speedUnits >= drivingThresholdD) motionLabel = "Driving"
     else if (isMovingNow) motionLabel = "Moving"
     else motionLabel = "Not Moving"
 

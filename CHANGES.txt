@@ -15,3 +15,11 @@
 11/03
 - Life360+: a phone's last-updated time moves only when its data changes
 - Life360+: fast polling now pauses while Life360 is rate-limiting
+
+11/07
+- Life360+: fixed the watchdog staying silent when an outage continues past a reboot or Done
+- Life360+: fewer Life360 requests while a member is moving
+- Life360+: acceleration no longer stays active at home while Life360 still says driving
+- Life360+: the tile shows Driving only at or above a set Minimum 'Driving' Speed
+- Life360+: Minimum 'Driving' Speed no longer changes the isDriving attribute
+- Life360+: removed the Minimum 'Transit' Speed setting

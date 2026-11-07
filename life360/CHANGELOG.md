@@ -1,5 +1,17 @@
 # Life360+ Changelog
 
+## 5.2.6
+
+**Fewer requests while driving, a watchdog fix, and Life360's motion values pass through untouched.**
+
+- **Watchdog:** Done, a reboot or a token recovery no longer wipes the last-success time, so an outage that continues past them still warns, and Step 5 keeps showing the last real success.
+- **Fewer requests while driving:** a slow tick skips a member the fast chain polled within the last two fast intervals.
+- **`inTransit` and `isDriving` are published exactly as Life360 sends them.** Logs from 11/02 to 11/07 showed `inTransit` clears about 1.4 min after a stop and `isDriving` about 7.9 min (sometimes 30+), so `isMoving` (built on `inTransit`) drives everything.
+- **Minimum 'Transit' Speed is removed.** Its only job was overriding `inTransit`. The stopped-phone rule now applies to everyone. Rules that relied on the override now see Life360's value.
+- **Minimum 'Driving' Speed only sets the tile's "Driving" label** and no longer changes `isDriving`. At the default of 0 the tile shows only "Moving" / "Not Moving".
+- **`acceleration`** is active while `isMoving` or away from home, so it no longer stays active at home while Life360 still says driving.
+- **Debug output:** one line per update, with status and speed in mph/kph (Minimum 'Driving' Speed shows only when set).
+
 ## 5.2.5
 
 **Less hub I/O, a new `isMoving` attribute, and a fix for phones that keep fast polling after they stop.**
