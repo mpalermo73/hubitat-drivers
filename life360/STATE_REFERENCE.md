@@ -66,7 +66,7 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 
 | Variable               | Type    | Set by                                    | Notes                                                                                                                                                            |
 | ---------------------- | ------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lastSuccessMs`        | Long    | `markFetchSuccess` (at most once a minute) | Watchdog input; triggers warn if stale > `max(pollFreq×10, 10min)`. Removed by `resetWatchdog()` (Done, token recovery) |
+| `lastSuccessMs`        | Long    | `markFetchSuccess` (at most once a minute) | Watchdog input; triggers warn if stale > `max(pollFreq×10, 10min)`. Not cleared by `resetWatchdog()`, so Step 5 keeps the last real success |
 | `inTransit-<memberId>` | Boolean | `notifyChildDevice` (echo from driver)    | Per-member moving flag: the driver's return value (`isMoving`: Life360 `inTransit` and Life360 still sending new data; key name kept for compatibility; identity-scoped; survives re-auth). Used by `ensureFastChain` to decide whether to seed a fast-poll chain for this member            |
 | `fastChain-<memberId>` | Boolean | `ensureFastChain()`                       | True while a per-member `runIn` fast-poll chain is active. Dropped by `scheduleSlowTimer()` (which calls `unschedule()`) and cleared when a chain ends naturally |
 
@@ -79,6 +79,7 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 | `etagChangedMs-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleMemberLocationResponse` | When this member's etag last changed; drives the stale-etag stop (APP_SPEC §13). Removed by `cleanupMemberState()` and `uninstalled()`; lost on reboot, which only restarts the clock |
 | `noEtagWarnMs` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleMemberLocationResponse` | When the "no l360-etag header" warning last fired (one per `MEMBERS_REFRESH_SECS`, app-wide). Cleared by `uninstalled()` |
 | `locTs-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleMemberLocationResponse` | Last location timestamp Life360 sent; used only by the debug `FALSE POSITIVE` line. Removed by `cleanupMemberState()` and `uninstalled()` |
+| `lastFetch-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `fastPollMember` | When the fast chain last polled this member; a slow tick skips a fast-chain member polled within two fast intervals. Removed by `cleanupMemberState()` and `uninstalled()` |
 
 ### UI one-shot status (button results)
 
@@ -106,7 +107,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 
 | Handler                   | Schedule                                                           | Set by                                   | Purpose                                                                                                                                                                                                                                                                    |
 | ------------------------- | ------------------------------------------------------------------ | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `handleSlowTimer`         | `0/<baseSecs> * * * * ? *` (sub-minute) or `0 */<min> * * * ? *`   | `scheduleSlowTimer()`                    | Each tick: watchdog, roster refresh (APP_SPEC §4.2), then `fetchLocations()` (or the `/users/me` probe when `tokenLikelyExpired`) |
+| `handleSlowTimer`         | `0/<baseSecs> * * * * ? *` (sub-minute) or `0 */<min> * * * ? *`   | `scheduleSlowTimer()`                    | Each tick: watchdog, roster refresh (APP_SPEC §4.2), then `fetchLocations(true)` (or the `/users/me` probe when `tokenLikelyExpired`) |
 | `fastPollMember`          | one-shot `runIn(<dynamicPollFreq>s)`, self-rescheduling per member | `ensureFastChain()` / `fastPollMember()` | Per-member fast-poll chain for in-transit members (APP_SPEC §4.3); ends when the member stops moving, is deselected, or `scheduleSlowTimer()` is called                                                               |
 | `sendTokenExpiryReminder` | one-shot `runIn(<notifyRepeatHours>h)`, self-rescheduling          | `scheduleTokenExpiryReminder()`          | Repeats the token-expiry notification while `tokenLikelyExpired` stays true; chain stops once the token is refreshed or `notifyRepeatHours = never`                                                                                                                        |
 
@@ -158,7 +159,7 @@ Set from `generatePresenceEvent`, with plain `sendEvent` (the hub drops unchange
 | Power Source        | `powerSource`  | `dc` / `battery`          | Charging source (Hubitat canonical enum values; the HTML tile displays `DC`/`BTRY` for compactness but the attribute itself is lowercase) |
 | Switch              | `switch`       | `on` / `off`              | **Repurposed:** WiFi connected (on) or not (off). Declared as `enum ["on","off"]`                                                         |
 | Contact Sensor      | `contact`      | `open` / `closed`         | **Repurposed:** charging (open) or on battery (closed). Declared as `enum ["open","closed"]`                                              |
-| Acceleration Sensor | `acceleration` | `active` / `inactive`     | **Repurposed:** in transit OR driving OR not at home. Declared as `enum ["active","inactive"]`                                            |
+| Acceleration Sensor | `acceleration` | `active` / `inactive`     | **Repurposed:** `isMoving` OR not at home. Declared as `enum ["active","inactive"]`                                            |
 
 ### Location
 

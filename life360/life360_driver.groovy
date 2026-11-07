@@ -342,16 +342,14 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     }
 
     String suffix = showMapsLink ? " — <a href='https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}' target='_blank'>Google Maps link</a>" : ""
-    boolean moving = inTransit || isDriving
     // isMoving = Life360 says in transit AND it has not gone quiet for too long (the same value the app uses
     // to decide on fast polling). The first poll after an upgrade has no stored isMoving, so fall back to inTransit.
     boolean isMovingNow = inTransit && !stillTooLong
     boolean prevIsMoving = (device.currentValue('isMoving') != null) ? (device.currentValue('isMoving') == 'true') : prevInTransit
     if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: ${showNames ? "lat:$latitude lng:$longitude" : "location hidden (names off)"} acc:${accuracy}m b:${battery}% wifi:$wifiState speed:${speed.round(2)}m/s inTransit:$inTransit isDriving:$isDriving isMoving:$isMovingNow"
     if (logEachPoll) {
-        // default on: log every poll when moving — but not while stationary (Life360 keeps
-        // inTransit/isDriving set at a light, in traffic, or for a while after arriving)
-        if (moving && !stillTooLong && speedUnits >= 1.0) {
+        // default on: log every poll while moving, but not at a light or in traffic
+        if (isMovingNow && speedUnits >= 1.0) {
             log.info("${displayMember(memberFirstName, showNames)}: moving @ ${speedUnits} ${useMiles ? 'mph' : 'kph'}${suffix}")
         }
     } else {
@@ -368,10 +366,6 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
 
     String sStatus = (memberPresence == "present") ? "At Home" : sprintf("%.1f", distanceUnits) + ((useMiles) ? " miles from Home" : " km from Home")
 
-    if (logEnable && (isDriving || inTransit)) {
-        log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: $sStatus, speedUnits:$speedUnits, transitThreshold:$transitThreshold, inTransit:$inTransit, drivingThreshold:$drivingThreshold, isDriving:$isDriving, isMoving:$isMovingNow"
-    }
-
     sendEvent(name: "status", value: sStatus)
 
     sendEvent(name: "inTransit", value: inTransit.toString())
@@ -381,9 +375,8 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     sendEvent(name: "distance", value: distanceUnits)
     sendEvent(name: "userActivity", value: userActivity)
 
-    // Set acceleration to active state if we are either moving or if we are anywhere outside home radius
-    // REPURPOSED CAPABILITY: 'acceleration' active/inactive = in transit OR driving OR away from home (NOT physical acceleration)
-    sendEvent(name: "acceleration", value: (inTransit || isDriving || memberPresence == "not present") ? "active" : "inactive")
+    // REPURPOSED CAPABILITY: 'acceleration' active/inactive = isMoving OR away from home (NOT physical acceleration)
+    sendEvent(name: "acceleration", value: (isMovingNow || memberPresence == "not present") ? "active" : "inactive")
 
     // *** Battery Level ***
     sendEvent(name: "battery", value: battery)

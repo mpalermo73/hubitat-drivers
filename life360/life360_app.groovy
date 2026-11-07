@@ -3,7 +3,7 @@ import java.net.SocketTimeoutException
 import groovy.transform.Field
 import java.util.concurrent.ConcurrentHashMap
 
-// Memory-only timestamps (lastMembersPollMs, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
+// Memory-only timestamps (lastMembersPollMs, lastFetch-<memberId>, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
 @Field static final ConcurrentHashMap RUNTIME = new ConcurrentHashMap()
 
 @Field static final int    TOKEN_EXPIRED_POLL_SECS         = 300   // slow-poll rate when token is flagged expired
@@ -583,7 +583,7 @@ def handleMembersResponse(response, data) {
 /**
  * fetch location for every selected member
  */
-boolean fetchLocations() {
+boolean fetchLocations(boolean routine = false) {
     if (isEmpty(circle)) {
         if (logEnable) log.debug("fetchLocations: circle not set")
         return false
@@ -615,6 +615,14 @@ boolean fetchLocations() {
     ctx.logDrivingTransitions = getLogDrivingTransitions()
 
     settings.users.each { memberId ->
+        // a slow tick skips a member the fast chain polled a moment ago; if the chain dies, the next slow tick polls them again
+        if (routine && state["fastChain-${memberId}"]) {
+            long agoMs = currentTimeMs - (rtGet("lastFetch-${memberId}") ?: 0L)
+            if (agoMs < dynamicPollFreqSecs() * 2000L) {
+                if (logEnable) log.debug("fetchLocations: member:${memberDisplayName(memberId)}: fast chain polled ${(long)(agoMs / 1000L)}s ago, skipping slow-tick poll")
+                return
+            }
+        }
         fetchMemberLocation(memberId, ctx)
     }
 
@@ -1022,7 +1030,7 @@ def updated() {
     state.message = null
     unschedule("sendTokenExpiryReminder")  // clear any pending repeat reminder
     state.tokenStatus = null        // clear so a freshly-pasted token doesn't show stale status
-    resetWatchdog()                 // restart the clock so the pre-fix gap can't trigger a stale WATCHDOG warning
+    resetWatchdog()                 // re-arm the WATCHDOG warning and clear its banner
     removeStateKeysWithPrefix(["etag-"])   // the next poll reaches the driver, so changed settings take effect
     if (!isEmpty(circle) && !isEmpty(access_token)) {   // Done = refresh the roster now, don't wait out the floor
         rtSet("lastMembersPollMs", new Date().getTime())
@@ -1040,7 +1048,7 @@ def initialize(evt) {
     removeObsoleteStateKeys()
     state.rateLimitedUntilMs = null // rate limit windows don't survive a reboot
     rtSet("lastMembersPollMs", null)  // refresh the roster on the first tick after reboot
-    resetWatchdog()                   // a hub that was down longer than the threshold must not warn on its first tick
+    resetWatchdog()                   // re-arm the WATCHDOG warning and clear its banner
     syncChildDevices()
     refreshUserSettings()
     scheduleSlowTimer()
@@ -1158,13 +1166,13 @@ def fastPollMember(data) {
     ctx.useMiles     = getUnitIsMiles()
     ctx.logRawPayload = getLogRawPayload()
     ctx.logDrivingTransitions = getLogDrivingTransitions()
+    rtSet("lastFetch-${memberId}", new Date().getTime())   // only the chain's polls count for the slow-tick skip
     fetchMemberLocation(memberId, ctx)
 }
 
 private void resetWatchdog() {
-    state.remove("lastSuccessMs")   // no watchdog until the next success
     if (state.watchdogWarned) state.watchdogWarned = false   // re-arm the rising-edge warning
-    if (state.message?.startsWith("WATCHDOG")) state.message = null   // its banner is stale once the clock restarts
+    if (state.message?.startsWith("WATCHDOG")) state.message = null   // the next tick re-checks and re-warns if still failing
 }
 
 /**
@@ -1210,7 +1218,7 @@ def handleSlowTimer() {
         return
     }
 
-    if (!fetchLocations()) return
+    if (!fetchLocations(true)) return
 }
 
 /**
@@ -1240,7 +1248,7 @@ def handleTokenProbeResponse(response, data) {
         // service is back — auto-recover; clear state before the JSON parse so a garbled
         // 200 body doesn't leave the app stuck in slow-poll (a valid 200 means auth is OK)
         log.info("tokenProbe: 200 OK — token is valid; auto-recovering from expired state")
-        resetWatchdog()   // restart the watchdog clock (see updated())
+        resetWatchdog()   // re-arm the WATCHDOG warning and clear its banner
         state.tokenLikelyExpired = false
         state.failCount = 0
         state.rateLimitedUntilMs = null
@@ -1350,6 +1358,7 @@ private void cleanupMemberState(String memberId) {
     }
     rtSet("etagChangedMs-${memberId}", null)
     rtSet("locTs-${memberId}", null)
+    rtSet("lastFetch-${memberId}", null)
 }
 
 /**

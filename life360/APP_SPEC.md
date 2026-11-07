@@ -156,12 +156,12 @@ token and the cookie jar are independent gates: both must be valid.
 
 `handleSlowTimer` is the single scheduled handler. Each tick, in order:
 
-1. **Watchdog.** If `state.lastSuccessMs` is older than `max(pollFreq×10, 10 min)`, the token isn't flagged,
-   and a circle and members are selected, log `WATCHDOG` once on the rising edge (`state.watchdogWarned`) and
-   set a banner. `lastSuccessMs` is written at most once a minute. `resetWatchdog()` (Done, token recovery,
-   reboot) removes it, so there is no watchdog until the next success, and clears the warning and banner.
+1. **Watchdog.** If `state.lastSuccessMs` is older than `max(pollFreq×10, 10 min)`, the token isn't flagged, and a circle and members are selected, log `WATCHDOG`
+   once on the rising edge (`state.watchdogWarned`) and set a banner. `lastSuccessMs` is written at most once a minute. `resetWatchdog()` (Done, token recovery,
+   reboot) clears the warning and banner but keeps `lastSuccessMs`, so an outage that continues past Done or a
+   reboot still warns (on the first tick if it is already past the threshold).
 2. **Roster refresh** (§4.2).
-3. **Locations.** If `tokenLikelyExpired`, run `probeTokenAfterExpiry()` (§5) and return; else `fetchLocations()`.
+3. **Locations.** If `tokenLikelyExpired`, run `probeTokenAfterExpiry()` (§5) and return; else `fetchLocations(true)`.
 
 ### 4.1 Location poll and the unchanged-etag skip
 
@@ -169,6 +169,9 @@ token and the cookie jar are independent gates: both must be valid.
 It builds one shared `ctx` map (home place, cookies, `showNames`, `showMapsLink`, `useMiles`, log flags)
 and fires one `asynchttpGet` per selected member. `fetchMemberLocation()` skips a member inside its
 transient-backoff window, and everything while a `429` window is open (this also stops the 20 s fast chain).
+On a slow tick (`fetchLocations(true)`) a member with a `fastChain-<id>` marker whose memory-only `lastFetch-<id>`
+(stamped only by `fastPollMember`) is under two fast intervals old is skipped; a dead chain stops refreshing it,
+so the next slow tick polls them.
 
 `handleMemberLocationResponse` on a `200`:
 
@@ -224,8 +227,8 @@ With `dynamicPolling` on and `dynamicPollFreq < pollFreq`, a member in transit a
   member is still in transit, selected and eligible; otherwise removes the marker. Then fetches the member.
 - `scheduleSlowTimer()` runs `unschedule()` (kills every job) and clears all `fastChain-*` markers; the next
   slow tick re-seeds movers. Callers are listed in §4.5.
-- A mover is occasionally polled twice at the same instant (slow tick plus chain); the unchanged-etag test
-  makes the second response a no-op.
+- The slow tick skips a mover the chain polled within two fast intervals (§4.1), so a mover gets one request
+  per fast interval, not two.
 
 ### 4.4 Child devices
 
@@ -320,8 +323,10 @@ it). It returns a boolean: `isMoving`, which is Life360 `inTransit` unless the a
 - **Motion:** `inTransit` / `isDriving` come from Life360; non-zero `transitThreshold` / `drivingThreshold`
   override them from `speedUnits`. `isMoving` is `inTransit` and not stale (§13); with `transitThreshold` set it
   equals `inTransit` (`drivingThreshold` doesn't affect it).
-- The "moving @ N mph/kph" info line fires only for `inTransit || isDriving` when the member isn't judged
-  still; it includes a Google Maps link only when `ctx.showMapsLink` is true.
+- `isDriving` only feeds its own attribute and the tile's "Driving" label: Life360 holds it set a median of
+  6.5 min after `inTransit` clears at a stop (11/02–11/07 capture). The "moving @ N mph/kph" info line fires
+  only while `isMoving` and at 1 mph or more; it includes a Google Maps link only when `ctx.showMapsLink` is true.
+  `acceleration` is active while `isMoving` or away from home.
 - The HTML tile (only with `generateHtml`) uses a `long` epoch for `since`. `haversine()` is `static`.
 
 ### 7.1 Presence logic
