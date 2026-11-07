@@ -716,7 +716,7 @@ def handleMemberLocationResponse(response, Map data) {
                 return
             }
             ctx = (ctx ?: [:]) + [staleSecs: staleSecs]   // copy: ctx is shared by every member this tick
-            rtSet(changedKey, nowMs)   // if the driver ignores staleSecs (Minimum Transit Speed set) this repeats once per window, not every poll
+            rtSet(changedKey, nowMs)   // if the driver call fails, this retries once per window, not every poll
         }
         def memberObj
         try {

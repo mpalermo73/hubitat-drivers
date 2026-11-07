@@ -69,10 +69,8 @@ the `Cookie` header from `state.cookies`.
 2. **Async.** Every per-member fetch is `asynchttpGet`. The HTTP timeout is capped at the member's own
    poll interval (max 30 s), so a hung request ends before its next tick; there is no in-flight guard.
 3. **Trust the payload; don't outsmart Life360.** `inTransit` / `isDriving` and the rest of `location` pass
-   straight through. The only override is the user's explicit speed thresholds (`transitThreshold` /
-   `drivingThreshold`). The one derived value is `isMoving` and the boolean the driver returns for the
-   fast-poll decision: both mean "Life360 is still sending new data" (§13), or just `inTransit` when a Minimum Transit Speed is set. `inTransit` / `isDriving` are
-   never altered.
+   straight through, never altered. The one derived value is `isMoving` and the boolean the driver returns
+   for the fast-poll decision: both mean "Life360 is still sending new data" (§13).
 4. **Force-update for freshness, not inference.** When a fresh fix is needed, ask the phone (§6).
 5. **Fail loud, fail safe.** On auth failure: clear session, flag the token, slow polling, notify once.
    Never hammer a dead endpoint.
@@ -320,12 +318,13 @@ it). It returns a boolean: `isMoving`, which is Life360 `inTransit` unless the a
   `since` is null-safe.
 - **Units**, in priority order: the driver's `unitOverride` when not `life360`; else `ctx.useMiles` from the
   app's `getUnitIsMiles()` (the app's `logUnits` override is applied there); else the hub's `temperatureScale`.
-- **Motion:** `inTransit` / `isDriving` come from Life360; non-zero `transitThreshold` / `drivingThreshold`
-  override them from `speedUnits`. `isMoving` is `inTransit` and not stale (§13); with `transitThreshold` set it
-  equals `inTransit` (`drivingThreshold` doesn't affect it).
-- `isDriving` only feeds its own attribute and the tile's "Driving" label: Life360 holds it set a median of
-  6.5 min after `inTransit` clears at a stop (11/02–11/07 capture). The "moving @ N mph/kph" info line fires
-  only while `isMoving` and at 1 mph or more; it includes a Google Maps link only when `ctx.showMapsLink` is true.
+- **Motion:** `inTransit` / `isDriving` are published exactly as Life360 sends them. `isMoving` is `inTransit`
+  and not stale (§13).
+- `isDriving` only feeds its own attribute: Life360 holds it set a median of 6.5 min after `inTransit`
+  clears at a stop (11/02–11/07 capture). The tile shows "Driving" only while `isMoving` with a non-zero
+  `drivingThreshold` and `speedUnits` at or above it; otherwise "Moving" / "Not Moving".
+  The "moving @ N mph/kph" info line fires only while `isMoving` and at 1 mph or more; it includes a Google
+  Maps link only when `ctx.showMapsLink` is true.
   `acceleration` is active while `isMoving` or away from home.
 - The HTML tile (only with `generateHtml`) uses a `long` epoch for `since`. `haversine()` is `static`.
 
@@ -362,7 +361,7 @@ rename, retype or repurpose any of them. New code is fine; renames and value cha
   `getShowMapsLink`, `getLogRawPayload`, `getLogDrivingTransitions`, `getUnitIsMiles`, `refresh`. Keeping these
   stable lets a new app drive an old installed driver and vice versa during a staged update.
 - **Device Network ID:** `"${app.id}.${memberId}"`. Changing it orphans every child device.
-- **Driver preferences:** `generateHtml`, `saveHistory`, `transitThreshold`, `drivingThreshold`,
+- **Driver preferences:** `generateHtml`, `saveHistory`, `drivingThreshold` (the tile's "Driving" label only),
   `avatarFontSize`, `avatarSize`, `logEnable`, `unitOverride`. Renaming one resets that user's saved choice.
   (`isMiles`, a bool, became the `unitOverride` enum in 5.2.0 with a one-time migration in `updated()`:
   `isMiles == false` → `metric`.)
