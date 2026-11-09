@@ -69,8 +69,9 @@ the `Cookie` header from `state.cookies`.
 2. **Async.** Every per-member fetch is `asynchttpGet`. The HTTP timeout is capped at the member's own
    poll interval (max 30 s), so a hung request ends before its next tick; there is no in-flight guard.
 3. **Trust the payload; don't outsmart Life360.** `inTransit` / `isDriving` and the rest of `location` pass
-   straight through, never altered. The one derived value is `isMoving` and the boolean the driver returns
-   for the fast-poll decision: both mean "Life360 is still sending new data" (§13).
+   straight through. The one exception is opt-in Early Parked Detection (§13): `inTransit` is shown false
+   after 240 s without new data at under 3.5 mph, and stays false until a fix shows 3.5 mph or more. Off,
+   nothing changes.
 4. **Force-update for freshness, not inference.** When a fresh fix is needed, ask the phone (§6).
 5. **Fail loud, fail safe.** On auth failure: clear session, flag the token, slow polling, notify once.
    Never hammer a dead endpoint.
@@ -181,12 +182,15 @@ so the next slow tick polls them.
   no driver call; `markFetchSuccess`; for a moving member `ensureFastChain` is called so a lost chain
   comes back.
 - Unchanged, in transit, and past that window: one driver call with `ctx + [staleSecs: n]` (a copy, since
-  `ctx` is shared across members), so the driver returns `isMoving` false and the fast chain ends (§13).
+  `ctx` is shared across members) only when Early Parked Detection is on for that member (`parkedClampOn`);
+  if the last speed is under 3.5 mph the driver returns false and the fast chain ends, otherwise it stays in
+  transit and is re-checked next window (§13). Off, the poll is handled like any unchanged one.
 - Changed (or no etag was sent): parse, `notifyChildDevice`, `markFetchSuccess`, store the etag. The
   `etagChangedMs-<id>` clock (memory-only) restarts.
-- Done, `refresh()`, Fetch Locations and Fetch Places drop the stored etags, so the next poll reaches the
-  driver (changed settings, a refreshed home place, new attributes). `refresh()` does not touch the
-  schedule, so running fast chains survive a device Refresh.
+- The stored etags are only cleared when a member is removed or its device is recreated. Done, `refresh()`,
+  Fetch Locations and Fetch Places set a memory-only `forceUpdate-<id>` per member instead, so the next poll
+  reaches each device once even when unchanged (changed settings, a new home place) while the etag, and with
+  it the parked state, is kept. `refresh()` does not touch the schedule, so fast chains survive a Refresh.
 
 `markFetchSuccess(memberId)` clears `failCount`, `tokenLikelyExpired`, `rateLimitedUntilMs`, `message`,
 `watchdogWarned` and that member's backoff, and stamps `lastSuccessMs`, skipping every write that would
@@ -258,7 +262,7 @@ Each member fetch is judged independently; a few **account-level** flags are sha
 | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `200`                                      | §4.1. `markFetchSuccess`.                                                                                                                                                                                                                                                                                                               |
 | `401`/`403`                                | **Account-level:** `clearSessionCache()`, `failCount++`; at ≥3 set `tokenLikelyExpired`, then `scheduleSlowTimer()` (slows to 300 s) **before** `notifyTokenExpired()`. **Order matters:** `scheduleSlowTimer()` calls `unschedule()`, which would cancel the reminder job `notifyTokenExpired()` registers. Below 3, a transient "will retry" banner. |
-| `429`                                      | **Account-level:** `rateLimitedUntilMs = now + (Retry-After ?: 60) + 10 s` (kept with `Math.max`); pauses every fetch including the fast chain.                                                                                                                                                                                       |
+| `429`                                      | **Account-level:** `rateLimitedUntilMs = now + min(Retry-After ?: 60, 900) + 10 s`; Done clears it (kept with `Math.max`); pauses every fetch including the fast chain.                                                                                                                                                                                       |
 | `408`, any `5xx` except `501`/`505`, network error (no status) | **Per-member** exponential backoff (below).                                                                                                                                                                                                                                                                  |
 | other                                      | Log an error and set a banner.                                                                                                                                                                                                                                                                                                          |
 
@@ -284,8 +288,8 @@ same account-level updates.
 (gated by `notifyTokenExpiry`); `scheduleTokenExpiryReminder()` / `sendTokenExpiryReminder()` repeat it
 (never/2/6/12/24/48 h) while the flag stays set, and are cancelled by Done and by recovery.
 
-**`clearSessionCache()`** removes `cookies` and the session-scoped keys (`etag-*`, `transientCount-*`,
-`transientUntilMs-*`). Identity keys (`inTransit-*`, `fastChain-*`) survive so transit state isn't lost on a
+**`clearSessionCache()`** removes `cookies` and the session-scoped keys (`transientCount-*`,
+`transientUntilMs-*`). Identity keys (`etag-*`, `inTransit-*`, `fastChain-*`) survive so transit state isn't lost on a
 mere token re-paste. `initialize()` calls it first, dropping caches left from before a reboot.
 
 **Banner copy.** Self-resolving conditions (429, transient 5xx, sub-threshold auth) use lowercase "will retry
@@ -309,7 +313,7 @@ with no auto-trigger; the dropdown resets after firing. **Accepted gap:** it doe
 ## 7. Driver (child device)
 
 Entry point: `generatePresenceEvent(member, places, home, ctx)` (`places` is always `null`; the driver ignores
-it). It returns a boolean: `isMoving`, which is Life360 `inTransit` unless the app passed `ctx.staleSecs`.
+it). It returns the published `inTransit`, which the app uses for fast polling.
 
 - Attributes use plain `sendEvent`; the hub drops unchanged values itself, so the driver keeps no
   "last sent" cache. Only `lastUpdated` and the `html` tile differ on every call, which is why the app avoids
@@ -318,14 +322,17 @@ it). It returns a boolean: `isMoving`, which is Life360 `inTransit` unless the a
   `since` is null-safe.
 - **Units**, in priority order: the driver's `unitOverride` when not `life360`; else `ctx.useMiles` from the
   app's `getUnitIsMiles()` (the app's `logUnits` override is applied there); else the hub's `temperatureScale`.
-- **Motion:** `inTransit` / `isDriving` are published exactly as Life360 sends them. `isMoving` is `inTransit`
-  and not stale (§13).
+- **Motion:** `inTransit` / `isDriving` are published as Life360 sends them, except that `inTransit` is
+  shown false when `ctx.staleSecs` arrives and the last speed is under `PARKED_MAX_SPEED_MS` (1.56 m/s, 3.5 mph);
+  the app sends `ctx.staleSecs` only with Early Parked Detection on (§13). With it on, a device showing
+  `inTransit` false also keeps it false when a new fix says in transit under that speed (stops 0 mph blips
+  while parked); `earlyParkedOn(ctx)` reads the device override, else `ctx.parkedClamp`. The
+  app's `parkedClamp` bool is the default; a device's `parkedClamp` enum (`app`/`on`/`off`) overrides it and
+  is decided by the device's `earlyParkedOn(ctx)`, which the app also calls (`parkedClampOn`) when the rule could apply.
 - `isDriving` only feeds its own attribute: Life360 holds it set a median of 6.5 min after `inTransit`
-  clears at a stop (11/02–11/07 capture). The tile shows "Driving" only while `isMoving` with a non-zero
-  `drivingThreshold` and `speedUnits` at or above it; otherwise "Moving" / "Not Moving".
-  The "moving @ N mph/kph" info line fires only while `isMoving` and at 1 mph or more; it includes a Google
-  Maps link only when `ctx.showMapsLink` is true.
-  `acceleration` is active while `isMoving` or away from home.
+  clears at a stop (11/02–11/07 capture). Everything else follows the published `inTransit`: the tile's
+  "Moving" / "Not Moving", `acceleration` (also active when away from home), the start/stop info lines, and
+  the "moving @ N mph/kph" line (only at 1 mph or more, with a Google Maps link when `ctx.showMapsLink`).
 - The HTML tile (only with `generateHtml`) uses a `long` epoch for `since`. `haversine()` is `static`.
 
 ### 7.1 Presence logic
@@ -345,6 +352,8 @@ address gives `"No Data"`. `status` is `"At Home"` or `"<x.x> miles from Home"` 
 
 Users have automations bound to these exact names, behaviors and values. An in-place update **must not**
 rename, retype or repurpose any of them. New code is fine; renames and value changes are not.
+The one deliberate exception, by the maintainer's decision: 5.2.6 removed `isMoving` (added in 5.2.5; use
+`inTransit`) and the `transitThreshold` / `drivingThreshold` preferences.
 
 - **Capabilities:** `Actuator`, `Presence Sensor`, `Sensor`, `Refresh`, `Battery`, `Power Source`, `Switch`,
   `Contact Sensor`, `Acceleration Sensor`.
@@ -356,12 +365,14 @@ rename, retype or repurpose any of them. New code is fine; renames and value cha
   `historyClearData`. (`arrived`/`departed` force `presence` and are overwritten by the next poll;
   `sendHistory`/`sendTheMap` are called by the external "Life360 Tracker" app.)
 - **App ↔ driver bridge:** the parent calls `childDevice.generatePresenceEvent(member, null, home, ctx)` and
-  reads the boolean (since 5.2.5 `isMoving`, before it Life360's `inTransit`), storing it in
+  reads the returned `inTransit`, storing it in
   `state["inTransit-<id>"]` (key name kept). Parent helpers the driver calls: `getShowNamesInLogs`,
-  `getShowMapsLink`, `getLogRawPayload`, `getLogDrivingTransitions`, `getUnitIsMiles`, `refresh`. Keeping these
+  `getShowMapsLink`, `getLogRawPayload`, `getLogDrivingTransitions`, `getUnitIsMiles`, `refresh`. Device methods the app calls besides `generatePresenceEvent`:
+  `earlyParkedOn(ctx)`, and `removeObsoleteAttributes(list)` from `removeObsoleteStateKeys()`, which holds the
+  one list of removed device attributes. Keeping these
   stable lets a new app drive an old installed driver and vice versa during a staged update.
 - **Device Network ID:** `"${app.id}.${memberId}"`. Changing it orphans every child device.
-- **Driver preferences:** `generateHtml`, `saveHistory`, `drivingThreshold` (the tile's "Driving" label only),
+- **Driver preferences:** `generateHtml`, `saveHistory`, `parkedClamp`,
   `avatarFontSize`, `avatarSize`, `logEnable`, `unitOverride`. Renaming one resets that user's saved choice.
   (`isMiles`, a bool, became the `unitOverride` enum in 5.2.0 with a one-time migration in `updated()`:
   `isMiles == false` → `metric`.)
@@ -383,9 +394,9 @@ skipped. Lat/lng are rounded to 5 decimals. The separate `bpt-history` / `numOfC
 
 [STATE_REFERENCE.md](STATE_REFERENCE.md) is the per-variable table. The rules that table can't express:
 
-- **Session-scoped** per-member keys (`etag-`, `transientCount-`, `transientUntilMs-`; list
+- **Session-scoped** per-member keys (`transientCount-`, `transientUntilMs-`; list
   `MEMBER_STATE_PREFIXES_SESSION`) are dropped by `clearSessionCache()`. **Identity-scoped** keys
-  (`inTransit-`, `fastChain-`; `MEMBER_STATE_PREFIXES_IDENTITY`) survive a re-auth. `cleanupMemberState()`
+  (`etag-`, `inTransit-`, `fastChain-`; `MEMBER_STATE_PREFIXES_IDENTITY`) survive a re-auth. `cleanupMemberState()`
   drops both for a removed member.
 - **Memory-only** values live in the `RUNTIME` static map, keyed `"<app.id>-<name>"` (use `rtGet`/`rtSet`;
   keys must be real `String`s, since a GString hashes differently): `lastMembersPollMs` (lost on reboot means
@@ -441,8 +452,7 @@ Never log the **full** bearer token or cookie jar, even behind `logRawPayload`.
 ## 11. Map view (`/view`)
 
 `renderView` (OAuth + `?access_token=<state.accessToken>`) collects each child device's latitude/longitude
-(skipping null and 0,0) with name, avatar, address, battery, presence, last update and `isMoving` (falling
-back to `inTransit`), serializes them to JSON, and renders one full-page map: OpenStreetMap (Leaflet) by
+(skipping null and 0,0) with name, avatar, address, battery, presence, last update and `inTransit`, serializes them to JSON, and renders one full-page map: OpenStreetMap (Leaflet) by
 default, or Google Maps when `googleMapsApiKey` is set. Both show avatar markers (initial-letter fallback),
 a member count, and refresh every 60 s.
 
@@ -456,8 +466,9 @@ Hubitat has no local test harness: install on a real hub against a real circle a
 2. **Soak the cookie path** for hours; confirm no 403 creep. This gate has killed the integration before.
 3. **Unchanged-etag skip:** an idle member logs `SUCCESS (200, etag unchanged -> treated as 304)` and the
    driver runs only when its data changes. A moving member's unchanged polls skip the same way; after 240 s
-   without a changed etag while still `inTransit`, debug logging shows
-   `no new Life360 data for Ns ... not fast polling` and the fast chain ends.
+   without a changed etag while still `inTransit`, with Early Parked Detection on, debug logging shows
+   `no new Life360 data for Ns at N mph; Early Parked Detection: inTransit false` and the fast chain ends; a
+   later 0 mph "in transit" fix logs `Early Parked Detection: still parked`.
 4. **Before any in-place release (§7.3):** diff the driver's attribute, capability, command and preference
    names and the app's setting names against the previous version; new entries must be purely additive.
 
@@ -466,8 +477,12 @@ Hubitat has no local test harness: install on a real hub against a real circle a
 ## 13. Why stillness is decided by the etag
 
 **Decision (2026-11-04).** A member Life360 still calls in transit is judged stopped when Life360's
-`l360-etag` for that member has not changed for `STALE_ETAG_SECS` (240 s, whatever the refresh rate). Life360 can keep `inTransit` (and even a stale speed) set after a phone stops, and the value the
-driver returns drives the fast poll rate, so this is a polling decision, not a change to Life360's data.
+`l360-etag` for that member has not changed for `STALE_ETAG_SECS` (240 s, whatever the refresh rate).
+Life360 can keep `inTransit` (and even a stale speed) set after a phone stops. Since 5.2.6 this is opt-in
+(Early Parked Detection): on, `inTransit` is shown false and fast polling ends, but only if the last speed
+was under 3.5 mph (added 2026-11-09, see "Highway gaps" below), and a parked phone stays parked until a fix
+shows 3.5 mph or more (14 of 65 `inTransit` turn-ons in the logs were parked blips, nearly all at 0 mph; 16
+of 51 real departures also began under 5 mph and register one update later); off, Life360's value stands.
 
 **What the etag is.** Life360 returns a full `200` with an identical etag when nothing changed, never a `304`
 (curl, 7 requests with a cookie jar: always 200, identical etag; Home Assistant's life360 library logged a
@@ -482,16 +497,16 @@ dynamic 20 s):
 | While moving, a fix arrives about every 40 s | The etag alternates changed/unchanged on 20 s fast polls. Longest unchanged run while someone was moving: 61 s (member A, 2026-11-03 21:38:24 to 21:39:25). Every other moving run was 40 s or less; member C's 18:15 to 18:35 drive never exceeded 3 polls |
 | A stopped-but-flagged phone goes quiet | Member A's parks at 22:12:01 and 2026-11-04 05:40:22: Life360 still said `inTransit:true` and the etag had been unchanged for 341 s and 262 s. Member B's four parks and member A's 21:57 park were cleared by Life360 itself |
 | Savings | 22:30 to 05:00: 529 member polls skipped, 121 reached the driver (81% skipped). Member A's 75-minute drive (20:42 to 21:57): 145 of 253 polls came back unchanged, each of which used to run the JSON parse and the driver |
-| Margin | Window = a flat 240 s, about 4× the 61 s worst moving gap, at every refresh rate. A window tied to the refresh rate would be only 20 to 60 s at the 10, 15 and 30 s settings, shorter than the usual 40 s between fixes; 240 s also keeps a short dead stretch (a tunnel) from flipping `isMoving` |
+| Margin | Window = a flat 240 s, about 4× the 61 s worst moving gap, at every refresh rate. A window tied to the refresh rate would be only 20 to 60 s at the 10, 15 and 30 s settings, shorter than the usual 40 s between fixes; 240 s also keeps a short dead stretch (a tunnel) from flipping `inTransit` with Early Parked Detection on |
 
 **Observed on the hub with the rule in place** (2026-11-04 to 2026-11-05, five members, about 30 drive/park
 cycles):
 
 - The stop rule fired 11 times, each on a phone Life360 still called `inTransit:true` (a parked phone, or one
   flagged on a single fix at speed 0), once the etag had been unchanged for the whole window (the next 20 s poll
-  after it). The fast chain ended on the next poll and `isMoving` went false while `inTransit` stayed true.
+  after it). The fast chain ended on the next poll while Life360's `inTransit` stayed true.
 - Every other stop was cleared by Life360 itself first; the rule was not needed.
-- No false stop during real driving. The longest gap between fixes while driving was 60 to 64 s.
+- No false stop during real driving in cars. The longest gap between fixes while driving was 60 to 64 s.
 - Life360 sometimes sets `inTransit:true` again for a few minutes at speed 0 and the same position, then clears
   it. That is Life360's own flicker, not the rule.
 - About 1 to 2% of changed-etag polls are false positives (below).
@@ -529,16 +544,15 @@ app skip the driver for moving members too.
 - If Life360 stops sending `l360-etag`, every poll reaches the driver and the stop rule never fires (a stuck
   member fast-polls as it did before this design). The app logs a WARN, at most once per roster-refresh
   interval, so the condition is visible.
-- Done, Refresh, Fetch Locations, Fetch Places and a device preference save drop the etags, which restarts a
-  stuck member's window once.
+- A reboot loses the memory-only window clock, which restarts a stuck member's window once.
 - A phone that stops reporting while genuinely moving looks identical to a stopped one, for any rule. Seen:
   Member C walking 2026-11-03 19:12 to 19:18; Life360 said `inTransit:true` at a frozen 1.72 mph, the etag was
-  unchanged for 6 min 20 s, and 20 s polls returned the identical payload. `isMoving` goes false; fast
-  polling had nothing to fetch.
+  unchanged for 6 min 20 s, and 20 s polls returned the identical payload. With Early Parked Detection on,
+  `inTransit` goes false and fast polling stops; fast polling had nothing to fetch.
 - Life360 under-reports walking: over a 30-minute walk the etag changed about every 6 to 9 minutes and
   `inTransit` was never set outside that frozen stretch. No polling strategy here can fix that.
-- Untested: a phone that goes quiet in a tunnel while driving. A gap longer than 240 s without a fix can
-  briefly flip `isMoving` false, then true on the next fix.
+- A phone that goes quiet while moving at speed (tunnel, highway gap) is not parked: the last speed stays
+  high, so the speed gate keeps `inTransit` true.
 - Life360's member-level `activity` field (`vehicle`/`unknown`, with its own timestamp) exists in raw
   payloads but lagged (still `vehicle` while parked with `inTransit:false`). No `isWalking` / `isFlying` /
   `isBicycling` field appears in the saved API docs or captured payloads. It drives nothing.
@@ -551,6 +565,21 @@ unchanged, and raises the 429 risk with several movers. Dropping the 5 and 10 s 
 the 10 and 15 s default choices) would lose nothing measurable. Saved values outside a shorter menu keep
 working, since `pollFreqSecs()` reads the setting directly. Left alone because it changes settings users may
 have chosen and is the maintainer's call.
+
+**Highway gaps and the speed gate** (2026-11-08, one member on a motorcycle, about 200 miles, checked
+against Google Timeline):
+
+- On two highway stretches (09:54 to 10:36, 12:43 to 13:00) Life360 sent a new fix only every 260 to 537 s
+  at 70 to 80 mph. Over 231 moving-to-moving gaps that day the median was 40 s and the 90th percentile 60 s,
+  but 8 exceeded 240 s. The time-only rule called the member stopped 9 times mid-ride; Life360's own
+  `inTransit` stayed true throughout.
+- Across all 49 firings in the 11/05 to 11/08 captures, the last speed separated cleanly: 40 parked firings
+  at 3.1 mph or less, 9 false ones at 22 mph or more. Life360 keeps the last speed while quiet, so the gate
+  sits at 3.5 mph, just above every parked firing seen. A phone above it is never parked, so a miss only
+  leaves Life360's own `inTransit` in place.
+- Against Google Timeline's arrivals, Life360's `inTransit` cleared 3, 5, 12 and 29 minutes late at four
+  stops; the time rule cut the last two to 7 and 8 minutes. Departures showed 1 to 3 minutes late, the
+  3-minute slow tick.
 
 **Reproduce.** The hub keeps a rolling log buffer: `curl http://<hub>/logs/past/json` returns a JSON array,
 oldest first, about 75 entries/min with all devices on debug, so pull at least every 15 min (pull, filter to

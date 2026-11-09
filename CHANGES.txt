@@ -23,3 +23,11 @@
 - Life360+: the tile shows Driving only at or above a set Minimum 'Driving' Speed
 - Life360+: Minimum 'Driving' Speed no longer changes the isDriving attribute
 - Life360+: removed the Minimum 'Transit' Speed setting
+
+11/08
+- Life360+: removed the isMoving attribute in favor of inTransit
+- Life360+: new Early Parked Detection setting
+- Life360+: removed the Minimum 'Driving' Speed setting
+
+11/09
+- Life360+: a Life360 rate-limit pause now lasts at most 15 minutes

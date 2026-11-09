@@ -20,6 +20,7 @@ import groovy.transform.Field
 @Field static final int    MAX_HISTORY_LOG_LINES   = 10      // max lines shown in the bpt-history tile
 @Field static final int    HISTORY_TILE_FOOTER_LEN = 18      // byte length of "</table></div>" closing tag
 @Field static final long   LAT_LNG_PRECISION       = 100000L // 1e5 — 5 decimal places (~1m GPS precision)
+@Field static final double PARKED_MAX_SPEED_MS     = 1.56    // 3.5 mph: Early Parked Detection speed gate
 @Field static final double GPS_JITTER_METERS       = 5.0      // minimum movement to record a new history entry
 @Field static final double MS_TO_MPH               = 2.23694  // m/s → miles per hour
 @Field static final double MS_TO_KPH               = 3.6      // m/s → kilometres per hour
@@ -54,7 +55,6 @@ metadata {
         // driving data
         attribute "inTransit", "enum", ["true", "false"]
         attribute "isDriving", "enum", ["true", "false"]
-        attribute "isMoving", "enum", ["true", "false"]   // inTransit AND Life360 has sent new data recently; goes false after 240 s without new data, usually before Life360 clears a stale inTransit
         attribute "speed", "number"
         attribute "distance", "number"
         attribute "since", "number"
@@ -121,7 +121,7 @@ preferences {
     input "generateHtml", "bool", title: "HTML Fields (tile, avatar)", required: true, defaultValue: false
     input "saveHistory", "bool", title: "Save Location History", description: "Save recent locations (time/lat/lng) to 'history' attribute", required: true, defaultValue: false
 
-    input "drivingThreshold", "number", title: "Minimum 'Driving' Speed", description: "Speed at which the tile shows 'Driving' instead of 'Moving'\n(0 = never show 'Driving')", required: true, defaultValue: 0
+    input "parkedClamp", "enum", title: "Early Parked Detection", description: "Show not moving after 4 min with nothing new under 3.5 mph, until Life360 reports 3.5 mph or faster", options: ["app": "Use app setting", "on": "On", "off": "Off"], required: true, defaultValue: "app"
 
     input "avatarFontSize", "number", title: "Avatar Font Size", required: true, defaultValue: 15
     input "avatarSize", "number", title: "Avatar Size by Percentage", required: true, defaultValue: 75
@@ -170,13 +170,24 @@ def updated() {
     refresh()
 }
 
+// called by the app's cleanup: clear attributes a later version removed
+void removeObsoleteAttributes(List<String> names) {
+    names?.each { device.deleteCurrentState(it) }   // no-op when absent
+}
+
+// Early Parked Detection: this device's override, else the app's setting; also called by the app
+boolean earlyParkedOn(Map ctx) {
+    String pref = settings.parkedClamp ?: "app"
+    return pref == "on" || (pref == "app" && ctx?.parkedClamp == true)
+}
+
 // called from Life360+ app
 // @param member - Life360 member object (user details)
 // @param thePlaces - unused; the app passes null. Kept only so the app<->driver signature stays stable.
 // @param home - Life360 circle which user selected as 'home'
-// @param ctx - optional poll-cycle context map (showNames, showMapsLink, useMiles; staleSecs only when Life360 has sent no new data for 240 s) hoisted by the app once per tick
+// @param ctx - optional poll-cycle context map (showNames, showMapsLink, useMiles; staleSecs only when Early Parked Detection is on and Life360 has sent no new data for 240 s) hoisted by the app once per tick
 //
-// @return true if the app should treat the member as in transit for polling (Life360 inTransit flag, unless Life360 has sent no new data for too long)
+// @return the published inTransit, which the app uses for fast polling
 boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     if (member == null) return false
     // Capture hub temperatureScale before `location` is shadowed by member.location below
@@ -317,33 +328,29 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     distanceUnits = ((distanceAway / 1000) / (useMiles ? KM_PER_MI : 1)).round(2)
 
     // ── Motion state ─────────────────────────────────────────────────────────────
-    // Life360's inTransit/isDriving are reported exactly as received. But Life360 can keep inTransit set after the phone has
-    // stopped sending fixes, and the value we return to the app drives the fast poll rate. The app passes ctx.staleSecs when
-    // Life360's etag has not changed (no new fix) for 240 s while it still says inTransit; isMoving then goes false.
-    double drivingThresholdD = (drivingThreshold ?: 0).toDouble()   // only decides the tile's "Driving" label
-    boolean noNewDataWhileInTransit = false
+    // Early Parked Detection: park on staleSecs below PARKED_MAX_SPEED_MS; stay parked until a fix reaches it
     if (inTransit && ctx?.staleSecs != null) {
-        if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: no new Life360 data for ${ctx.staleSecs}s with inTransit:true; not fast polling"
-        noNewDataWhileInTransit = true
+        boolean slow = speed < PARKED_MAX_SPEED_MS
+        if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: no new Life360 data for ${ctx.staleSecs}s at ${speedUnits}${useMiles ? 'mph' : 'kph'}; Early Parked Detection: ${slow ? 'inTransit false' : 'still moving'}"
+        if (slow) inTransit = false
+    } else if (inTransit && !prevInTransit && speed < PARKED_MAX_SPEED_MS && earlyParkedOn(ctx)) {
+        if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: Life360 says in transit at ${speedUnits}${useMiles ? 'mph' : 'kph'}; Early Parked Detection: still parked"
+        inTransit = false
     }
 
     String suffix = showMapsLink ? " — <a href='https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}' target='_blank'>Google Maps link</a>" : ""
-    // isMoving = Life360 says in transit AND it has not gone quiet for too long (the same value the app uses
-    // to decide on fast polling). The first poll after an upgrade has no stored isMoving, so fall back to inTransit.
-    boolean isMovingNow = inTransit && !noNewDataWhileInTransit
-    boolean prevIsMoving = (device.currentValue('isMoving') != null) ? (device.currentValue('isMoving') == 'true') : prevInTransit
     String sStatus = (memberPresence == "present") ? "At Home" : sprintf("%.1f", distanceUnits) + ((useMiles) ? " miles from Home" : " km from Home")
-    if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: ${showNames ? "lat:$latitude lng:$longitude" : "location hidden (names off)"} acc:${accuracy}m b:${battery}% wifi:$wifiState status:$sStatus speed:${speedUnits}${useMiles ? 'mph' : 'kph'}${drivingThresholdD > 0.0 ? " drivingThreshold:$drivingThreshold" : ""} inTransit:$inTransit isDriving:$isDriving isMoving:$isMovingNow"
+    if (logEnable) log.debug "generatePresenceEvent: ${displayMember(memberFirstName, showNames)}: ${showNames ? "lat:$latitude lng:$longitude" : "location hidden (names off)"} acc:${accuracy}m b:${battery}% wifi:$wifiState status:$sStatus speed:${speedUnits}${useMiles ? 'mph' : 'kph'} inTransit:$inTransit isDriving:$isDriving"
     if (logEachPoll) {
         // default on: log every poll while moving, but not at a light or in traffic
-        if (isMovingNow && speedUnits >= 1.0) {
+        if (inTransit && speedUnits >= 1.0) {
             log.info("${displayMember(memberFirstName, showNames)}: moving @ ${speedUnits} ${useMiles ? 'mph' : 'kph'}${suffix}")
         }
     } else {
-        // quiet mode: only log start/stop of movement (isMoving: in transit and Life360 has sent new data)
-        if (isMovingNow && !prevIsMoving) {
+        // quiet mode: only log start/stop of movement
+        if (inTransit && !prevInTransit) {
             log.info("${displayMember(memberFirstName, showNames)}: started moving${suffix}")
-        } else if (!isMovingNow && prevIsMoving) {
+        } else if (!inTransit && prevInTransit) {
             log.info("${displayMember(memberFirstName, showNames)}: stopped moving${suffix}")
         }
     }
@@ -352,13 +359,12 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
 
     sendEvent(name: "inTransit", value: inTransit.toString())
     sendEvent(name: "isDriving", value: isDriving.toString())
-    sendEvent(name: "isMoving", value: isMovingNow.toString())
     sendEvent(name: "speed", value: speedUnits)
     sendEvent(name: "distance", value: distanceUnits)
     sendEvent(name: "userActivity", value: userActivity)
 
-    // REPURPOSED CAPABILITY: 'acceleration' active/inactive = isMoving OR away from home (NOT physical acceleration)
-    sendEvent(name: "acceleration", value: (isMovingNow || memberPresence == "not present") ? "active" : "inactive")
+    // REPURPOSED CAPABILITY: 'acceleration' active/inactive = inTransit OR away from home (NOT physical acceleration)
+    sendEvent(name: "acceleration", value: (inTransit || memberPresence == "not present") ? "active" : "inactive")
 
     // *** Battery Level ***
     sendEvent(name: "battery", value: battery)
@@ -400,15 +406,12 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
 
     // ** HTML attributes (optional) **
     if (!generateHtml) {
-        return isMovingNow
+        return inTransit
     }
 
     if (avatarHtml != device.currentValue("avatarHtml")) sendEvent(name: "avatarHtml", value: avatarHtml)
 
-    String motionLabel
-    if (isMovingNow && drivingThresholdD > 0.0 && speedUnits >= drivingThresholdD) motionLabel = "Driving"
-    else if (isMovingNow) motionLabel = "Moving"
-    else motionLabel = "Not Moving"
+    String motionLabel = inTransit ? "Moving" : "Not Moving"
 
     long sEpoch = since ?: 0L
     Date theDate = (sEpoch == 0L) ? new Date(0) : new Date(sEpoch * 1000L)
@@ -424,7 +427,7 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     tileMap += "Since: ${dateSince}<br>"
     tileMap += (sStatus == "At Home") ? "" : "${sStatus}<br>"
     tileMap += "${motionLabel}"
-    if (address1 != "Home" && isMovingNow) {
+    if (address1 != "Home" && inTransit) {
         tileMap += " @ ${sprintf("%.1f", speedUnits)} "
         tileMap += useMiles ? "MPH" : "KPH"
     }
@@ -436,7 +439,7 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     int tileDevice1Count = tileMap.length()
     if (tileDevice1Count > HUBITAT_TILE_MAX_CHARS) log.warn "generatePresenceEvent: Too many characters to display on Dashboard (${tileDevice1Count})"
     sendEvent(name: "html", value: tileMap, displayed: true)
-    return isMovingNow
+    return inTransit
 }
 
 /**

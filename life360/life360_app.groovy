@@ -3,7 +3,7 @@ import java.net.SocketTimeoutException
 import groovy.transform.Field
 import java.util.concurrent.ConcurrentHashMap
 
-// Memory-only timestamps (lastMembersPollMs, lastFetch-<memberId>, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
+// Memory-only timestamps (lastMembersPollMs, lastFetch-<memberId>, forceUpdate-<memberId>, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
 @Field static final ConcurrentHashMap RUNTIME = new ConcurrentHashMap()
 
 @Field static final int    TOKEN_EXPIRED_POLL_SECS         = 300   // slow-poll rate when token is flagged expired
@@ -14,20 +14,21 @@ import java.util.concurrent.ConcurrentHashMap
 @Field static final int    SECS_PER_HOUR                   = 3600  // seconds per hour
 @Field static final int    RATE_LIMIT_BUFFER_SECS          = 10    // extra seconds added to Retry-After on 429
 @Field static final int    RATE_LIMIT_FALLBACK_SECS        = 60    // fallback Retry-After when header is absent
+@Field static final int    RATE_LIMIT_MAX_SECS             = 900   // cap on Retry-After
 @Field static final int    FORCE_UPDATE_FETCH_DELAY_SECS   = 6     // seconds to wait after force-update before re-fetching (~5s for Life360 to push fresh GPS)
 @Field static final int    CIRCLES_API_VERSION             = 4     // Life360 API version for the /circles endpoint
 @Field static final int    MAX_BACKOFF_SHIFT               = 6     // max bit-shift for exponential backoff (caps at 2^6 = 64× base interval)
 @Field static final int    MEMBERS_REFRESH_SECS            = 900   // how often the roster (/members) is re-read — membership rarely changes, so never hit it faster than this even at a fast pollFreq
 @Field static final int    MEMBERS_RETRY_NO_ROSTER_SECS    = 300   // retry rate while there is no roster yet
-@Field static final int    STALE_ETAG_SECS                 = 240   // unchanged etag this long (a moving phone's fixes are at most ~60 s apart) and Life360 still says in transit -> treated as not moving
+@Field static final int    STALE_ETAG_SECS                 = 240   // unchanged etag this long (a moving phone's fixes are at most ~60 s apart) and Life360 still says in transit -> Early Parked Detection (if on) shows inTransit false
 @Field static final String LIFE360_BASE_URL_V3             = "https://api-cloudfront.life360.com/v3"
 @Field static final String LIFE360_BASE_URL_V4             = "https://api-cloudfront.life360.com/v4"
 
-// Per-member state key prefixes, by scope. SESSION keys are session-bound and dropped on
-// auth failure (clearSessionCache); IDENTITY keys outlive a re-auth. Removing a member drops
+// Per-member state key prefixes, by scope. SESSION keys (backoff) are dropped on auth failure
+// and reboot (clearSessionCache); IDENTITY keys, including etags, outlive both. Removing a member drops
 // both (cleanupMemberState). Single source of truth so the two cleanup paths can't drift.
-@Field static final List<String> MEMBER_STATE_PREFIXES_SESSION  = ["etag-", "transientCount-", "transientUntilMs-"]
-@Field static final List<String> MEMBER_STATE_PREFIXES_IDENTITY = ["inTransit-", "fastChain-"]
+@Field static final List<String> MEMBER_STATE_PREFIXES_SESSION  = ["transientCount-", "transientUntilMs-"]
+@Field static final List<String> MEMBER_STATE_PREFIXES_IDENTITY = ["etag-", "inTransit-", "fastChain-"]
 
 // 5xx statuses that are a permanent server-side "no" rather than a blip worth retrying. Every
 // other 5xx — Life360 origin 500/502/503/504 and the Cloudflare edge codes 520-530 — heals on
@@ -163,6 +164,7 @@ def mainPage() {
             if (settings.dynamicPolling) {
                 input(name: "dynamicPollFreq", type: "enum", title: "Dynamic Refresh Rate", required: false, defaultValue: "20", width: 6, options: ['5': '5 seconds', '10': '10 seconds', '20': '20 seconds', '30': '30 seconds'])
             }
+            input(name: "parkedClamp", type: "bool", defaultValue: false, title: "Early Parked Detection", description: "Show a phone as not moving sooner: when Life360 still says moving but has sent nothing new for 4 minutes and the last speed was under 3.5 mph. It then stays not moving until Life360 reports 3.5 mph or faster. Each member device can override this.")
         }
 
         section(header("Notifications")) {
@@ -241,7 +243,7 @@ def appButtonHandler(String button) {
             fetchMembers()
             break
         case "fetchLocationsBtn":
-            removeStateKeysWithPrefix(["etag-"])   // Fetch Locations: reach the driver even for a parked member
+            forceNextDeviceUpdate()
             fetchLocations()
             break
         case "generateViewLinkBtn":
@@ -490,7 +492,7 @@ def fetchPlaces() {
                 if (getLogRawPayload()) log.trace("fetchPlaces: ${response.status} ${response.data}")
                 if (response.status == 200) {
                     state.places = response.data.places?.collect { [id: it.id, name: it.name, latitude: it.latitude, longitude: it.longitude, radius: it.radius] }
-                    removeStateKeysWithPrefix(["etag-"])   // parked members re-evaluate presence against the refreshed places
+                    forceNextDeviceUpdate()
                     if (!state.places) log.warn("fetchPlaces: 0 places returned — check that your Life360 circle has at least one place")
                     if (logEnable) log.debug("fetchPlaces: ${state.places?.size() ?: 0} places: ${state.places?.collect { showNamesInLogs() ? it.name : it.id }}")
                     state.message = null
@@ -605,14 +607,7 @@ boolean fetchLocations(boolean routine = false) {
         return false
     }
 
-    // build context once per poll cycle — shared across all member fetches this tick
-    def ctx = buildPlacesContext()
-    ctx.cookies      = state["cookies"]
-    ctx.showNames    = showNamesInLogs()
-    ctx.showMapsLink = (settings.logShowMapsLink != false)
-    ctx.useMiles     = getUnitIsMiles()   // null = not yet known; driver falls back to its local pref
-    ctx.logRawPayload = getLogRawPayload()
-    ctx.logDrivingTransitions = getLogDrivingTransitions()
+    def ctx = buildPollContext()   // shared across all member fetches this tick
 
     settings.users.each { memberId ->
         // a slow tick skips a member the fast chain polled a moment ago; if the chain dies, the next slow tick polls them again
@@ -660,7 +655,7 @@ def fetchMemberLocation(memberId, Map ctx = null) {
     def tag = state["etag-${memberId}"]
     if (tag) params["headers"]["If-None-Match"] = tag
 
-    asynchttpGet("handleMemberLocationResponse", params, [memberId: memberId, ctx: ctx, etagSent: tag])
+    asynchttpGet("handleMemberLocationResponse", params, [memberId: memberId, ctx: ctx, etagSent: tag, sentMs: startMs])
 }
 
 Long rtGet(String name) { return RUNTIME[rtKey(name)] as Long }
@@ -692,11 +687,12 @@ def handleMemberLocationResponse(response, Map data) {
     if (status == 200) {
         // Life360 no longer answers If-None-Match with a 304: it returns a full 200 carrying the same etag. An unchanged etag
         // means no new fix, so skip the JSON parse and the driver call. A member Life360 still calls in transit whose etag has
-        // not changed for STALE_ETAG_SECS gets one driver call carrying staleSecs, so the driver reports isMoving false.
-        // Done, refresh and Fetch Locations drop the stored etags, so the next poll reaches the driver (settings, new attributes).
+        // not changed for STALE_ETAG_SECS gets one driver call carrying staleSecs only with Early Parked Detection on for that member; the driver then shows inTransit false.
         def eTag = response.headers?.find { it.key?.equalsIgnoreCase("l360-etag") }?.value
         def prevTag = state["etag-${memberId}"]
         boolean unchanged = (eTag && (eTag == data.etagSent || eTag == prevTag))   // sent tag too: an older response arriving after a newer one must not roll the etag back
+        Long forcedAt = rtGet("forceUpdate-${memberId}")
+        boolean forced = forcedAt != null && ((data.sentMs ?: 0L) as long) >= forcedAt   // only a request sent after the force
         long nowMs = new Date().getTime()
         if (!eTag && nowMs - (rtGet("noEtagWarnMs") ?: 0L) > MEMBERS_REFRESH_SECS * 1000L) {   // at most one warning per roster-refresh interval, for the whole app
             rtSet("noEtagWarnMs", nowMs)
@@ -705,10 +701,11 @@ def handleMemberLocationResponse(response, Map data) {
         String changedKey = "etagChangedMs-${memberId}"
         Long changedAt = rtGet(changedKey)
         if (!unchanged || changedAt == null) { changedAt = nowMs; rtSet(changedKey, nowMs) }
-        if (unchanged) {
+        if (unchanged && !forced) {
             boolean moving = isMemberInTransit(memberId)
             long staleSecs = (long)((nowMs - changedAt) / 1000L)
-            if (!moving || staleSecs < STALE_ETAG_SECS) {
+            if (moving && staleSecs >= STALE_ETAG_SECS) rtSet(changedKey, nowMs)   // one Early Parked Detection check per window
+            if (!moving || staleSecs < STALE_ETAG_SECS || !parkedClampOn(memberId)) {
                 if (logEnable) log.debug("fetchMemberLocation: SUCCESS (200, etag unchanged -> treated as 304), member:${memberName}")
                 if (state.watchdogWarned) log.info("WATCHDOG: cleared — Life360 fetch succeeded again (unchanged)")
                 markFetchSuccess(memberId)
@@ -716,7 +713,6 @@ def handleMemberLocationResponse(response, Map data) {
                 return
             }
             ctx = (ctx ?: [:]) + [staleSecs: staleSecs]   // copy: ctx is shared by every member this tick
-            rtSet(changedKey, nowMs)   // if the driver call fails, this retries once per window, not every poll
         }
         def memberObj
         try {
@@ -733,6 +729,7 @@ def handleMemberLocationResponse(response, Map data) {
         if (locTs != null) rtSet(locTsKey, locTs)
         if (ctx?.logRawPayload ?: getLogRawPayload()) log.trace("fetchMemberLocation: 200 member:${memberName} ${memberObj}")
         notifyChildDevice(memberId, memberObj, ctx)
+        if (forced) rtSet("forceUpdate-${memberId}", null)
         if (state.watchdogWarned) log.info("WATCHDOG: cleared — Life360 fetch succeeded again")
         markFetchSuccess(memberId)
         if (eTag && !unchanged) state["etag-${memberId}"] = eTag
@@ -762,7 +759,7 @@ def handleMemberLocationResponse(response, Map data) {
     } else if (status == 429) {
         Integer retryAfter = null
         try { retryAfter = response.headers?.find { it.key?.equalsIgnoreCase("Retry-After") }?.value?.toInteger() } catch (ignored) {}
-        Integer delaySecs = (retryAfter ?: RATE_LIMIT_FALLBACK_SECS) + RATE_LIMIT_BUFFER_SECS
+        Integer delaySecs = Math.min(retryAfter ?: RATE_LIMIT_FALLBACK_SECS, RATE_LIMIT_MAX_SECS) + RATE_LIMIT_BUFFER_SECS
         state.rateLimitedUntilMs = Math.max((state.rateLimitedUntilMs ?: 0L) as long, new Date().getTime() + (delaySecs * 1000L))
         log.warn("fetchMemberLocation: RATE_LIMIT (429); backing off ${delaySecs}s")
         state.message = "Rate limited (429) — backing off ${delaySecs}s, will retry automatically"
@@ -857,7 +854,7 @@ String handleException(String tag, Exception e) {
     }
     if (status == 429) {
         Integer retryAfter = readRetryAfterSecs(e)
-        Integer delaySecs = (retryAfter ?: RATE_LIMIT_FALLBACK_SECS) + RATE_LIMIT_BUFFER_SECS
+        Integer delaySecs = Math.min(retryAfter ?: RATE_LIMIT_FALLBACK_SECS, RATE_LIMIT_MAX_SECS) + RATE_LIMIT_BUFFER_SECS
         state.rateLimitedUntilMs = Math.max((state.rateLimitedUntilMs ?: 0L) as long, new Date().getTime() + (delaySecs * 1000L))
         log.warn("${tag}: RATE_LIMIT (429); backing off ${delaySecs}s")
         state.message = "Rate limited (429) — backing off ${delaySecs}s, will retry automatically"
@@ -1026,12 +1023,12 @@ def updated() {
     // user clicked Done — assume any pasted token is fresh; let polling resume
     state.tokenLikelyExpired = false
     state.failCount = 0
-    state.rateLimitedUntilMs = null
+    state.rateLimitedUntilMs = null   // Done clears a rate-limit pause
     state.message = null
     unschedule("sendTokenExpiryReminder")  // clear any pending repeat reminder
     state.tokenStatus = null        // clear so a freshly-pasted token doesn't show stale status
     resetWatchdog()                 // re-arm the WATCHDOG warning and clear its banner
-    removeStateKeysWithPrefix(["etag-"])   // the next poll reaches the driver, so changed settings take effect
+    forceNextDeviceUpdate()
     if (!isEmpty(circle) && !isEmpty(access_token)) {   // Done = refresh the roster now, don't wait out the floor
         rtSet("lastMembersPollMs", new Date().getTime())
         fetchMembers()
@@ -1044,9 +1041,8 @@ def updated() {
 
 def initialize(evt) {
     log.info("initialize: ${evt.device} ${evt.value} ${evt.name}")
-    clearSessionCache()             // drop session caches (etags, cookies, backoff) left over from before the restart
+    clearSessionCache()             // drop session caches (cookies, backoff) left over from before the restart
     removeObsoleteStateKeys()
-    state.rateLimitedUntilMs = null // rate limit windows don't survive a reboot
     rtSet("lastMembersPollMs", null)  // refresh the roster on the first tick after reboot
     resetWatchdog()                   // re-arm the WATCHDOG warning and clear its banner
     syncChildDevices()
@@ -1058,6 +1054,10 @@ private void removeObsoleteStateKeys() {
     ["placesJson", "cachedHome", "scheduledBaseSecs", "pollIntervalSecs",
      "dynamicPollingActive", "memberInTransit", "lastCirclesFetchMs", "lastCirclesPollMs", "memberCount"].each { state.remove(it) }
     removeStateKeysWithPrefix(["inflight-"])  // in-flight markers written to state by earlier versions
+    List<String> obsoleteAttributes = ["isMoving"]   // device attributes removed in later versions
+    getChildDevices()?.each { dev ->
+        try { dev.removeObsoleteAttributes(obsoleteAttributes) } catch (e) { log.warn("removeObsoleteStateKeys: ${dev.displayName} could not clear old attributes: ${e}") }
+    }
 }
 
 
@@ -1068,10 +1068,10 @@ def uninstalled() {
 }
 
 /**
- * can be called by child device to force update location
+ * called by a child device's Refresh (and its preference save): fetch now and update every device
  */
 def refresh() {
-    removeStateKeysWithPrefix(["etag-"])   // the next poll must reach the driver even for a parked member
+    forceNextDeviceUpdate()
     fetchLocations()
 }
 
@@ -1113,6 +1113,18 @@ def scheduleSlowTimer() {
 // poll-rate accessors — single source of truth for the UI defaults so the fallback can't drift
 private int pollFreqSecs()        { return (settings.pollFreq ?: "60").toInteger() }
 private int dynamicPollFreqSecs() { return (settings.dynamicPollFreq ?: "20").toInteger() }
+
+// next poll of each member reaches its device even if unchanged
+private void forceNextDeviceUpdate() {
+    long nowMs = new Date().getTime()
+    settings.users?.each { rtSet("forceUpdate-${it}", nowMs) }
+}
+
+// Early Parked Detection for a member, decided by the device (its override, else this app's setting)
+private boolean parkedClampOn(memberId) {
+    try { return getChildDevice("${app.id}.${memberId}")?.earlyParkedOn([parkedClamp: settings.parkedClamp == true]) == true }
+    catch (e) { log.warn("parkedClampOn: could not ask the device about Early Parked Detection: ${e}"); return false }
+}
 
 /**
  * Whether the per-member fast-poll chains should run at all: dynamic polling enabled, the
@@ -1159,13 +1171,7 @@ def fastPollMember(data) {
         state.remove("fastChain-${memberId}")
         if (logEnable) log.debug("fastPollMember: member:${memberDisplayName(memberId)}: chain ended, rejoining slow poll")
     }
-    def ctx = buildPlacesContext()
-    ctx.cookies      = state["cookies"]
-    ctx.showNames    = showNamesInLogs()
-    ctx.showMapsLink = (settings.logShowMapsLink != false)
-    ctx.useMiles     = getUnitIsMiles()
-    ctx.logRawPayload = getLogRawPayload()
-    ctx.logDrivingTransitions = getLogDrivingTransitions()
+    def ctx = buildPollContext()
     rtSet("lastFetch-${memberId}", new Date().getTime())   // only the chain's polls count for the slow-tick skip
     fetchMemberLocation(memberId, ctx)
 }
@@ -1313,6 +1319,7 @@ def createChildDevices() {
             log.info "createChildDevices: Creating Life360 Device: ${showNamesInLogs() ? memberName : memberId}"
             try {
                 addChildDevice("jpage4500", "Life360+ Driver", externalId, null, ["name": "Life360 - ${memberName}", isComponent: false])
+                state.remove("etag-${memberId}")   // new device: first poll must reach it
                 log.info "createChildDevices: Child Device Successfully Created"
             }
             catch (e) {
@@ -1359,6 +1366,7 @@ private void cleanupMemberState(String memberId) {
     rtSet("etagChangedMs-${memberId}", null)
     rtSet("locTs-${memberId}", null)
     rtSet("lastFetch-${memberId}", null)
+    rtSet("forceUpdate-${memberId}", null)
 }
 
 /**
@@ -1403,7 +1411,7 @@ def notifyChildDevice(memberId, memberObj, Map ctx = null) {
             boolean prevInTransit = isMemberInTransit(memberId)
             boolean transitFlipped = (prevInTransit != inTransit)
             if (transitFlipped) {
-                if (logEnable) log.debug("notifyChildDevice: ${showNamesInLogs() ? memberObj.firstName : memberId}: state changed: isMoving:${inTransit}")
+                if (logEnable) log.debug("notifyChildDevice: ${showNamesInLogs() ? memberObj.firstName : memberId}: state changed: inTransit:${inTransit}")
                 state["inTransit-${memberId}"] = inTransit
             }
             // Re-seed even without a transit flip: after a reboot the runIn chain is gone but
@@ -1420,6 +1428,19 @@ def notifyChildDevice(memberId, memberObj, Map ctx = null) {
 
 private Map buildPlacesContext() {
     return [home: state.places?.find { it.id == settings.place }]
+}
+
+// per-poll context passed to the driver
+private Map buildPollContext() {
+    Map ctx = buildPlacesContext()
+    ctx.cookies      = state["cookies"]
+    ctx.showNames    = showNamesInLogs()
+    ctx.showMapsLink = (settings.logShowMapsLink != false)
+    ctx.useMiles     = getUnitIsMiles()   // null = not yet known; driver falls back to its local pref
+    ctx.logRawPayload = getLogRawPayload()
+    ctx.logDrivingTransitions = getLogDrivingTransitions()
+    ctx.parkedClamp  = (settings.parkedClamp == true)   // the app's Early Parked Detection default
+    return ctx
 }
 
 void captureCookies(response) {
@@ -1513,11 +1534,11 @@ private boolean mergeCookie(String cookieVal) {
 }
 
 /**
- * Drop the session-bound cache (cookies + per-member etags). Mirrors what
+ * Drop the session-bound cache (cookies + per-member backoff). Mirrors what
  * ha-life360's coordinator does when it sees a LoginError before re-auth.
  */
 void clearSessionCache() {
-    if (logEnable) log.debug("clearSessionCache: dropping cookie jar [${cookieJarSummary()}] + etags/backoff (likely after auth failure)")
+    if (logEnable) log.debug("clearSessionCache: dropping cookie jar [${cookieJarSummary()}] + backoff (likely after auth failure)")
     state.remove("cookies")
     // only session-scoped keys — identity keys (inTransit) survive a re-auth so transit state
     // isn't lost when a token is merely re-pasted.
@@ -1552,7 +1573,7 @@ def renderView() {
                 battery   : (dev.currentValue("battery") ?: "").toString(),
                 presence  : (dev.currentValue("presence") ?: "").toString(),
                 updated   : (dev.currentValue("lastLocationUpdate") ?: "").toString(),
-                inTransit : (dev.currentValue("isMoving") ?: dev.currentValue("inTransit") ?: "false").toString()
+                inTransit : (dev.currentValue("inTransit") ?: "false").toString()
             ]
         } catch (e) {
             if (logEnable) log.debug("renderView: skipping ${dev.displayName}: ${e}")
