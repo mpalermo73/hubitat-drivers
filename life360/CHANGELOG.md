@@ -20,6 +20,7 @@
 - **Done, Refresh and reboots no longer wipe stored data:** the per-member unchanged-data tags are kept, so a parked phone stays parked. Done, Refresh, Fetch Locations and Fetch Places still send every device one fresh update, so changed settings show right away.
 - **Rate limits:** a Life360 rate-limit pause now lasts at most 15 minutes, survives a reboot, and Done still clears it.
 - **Debug output:** one line per update, with status and speed in mph/kph.
+- **New Collect Timing Stats setting** (Logging section, next to the debug options, off by default): a table of how often and how long the app's main functions run, kept in memory only.
 
 ## 5.2.5
 

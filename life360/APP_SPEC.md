@@ -398,6 +398,15 @@ skipped. Lat/lng are rounded to 5 decimals. The separate `bpt-history` / `numOfC
   `MEMBER_STATE_PREFIXES_SESSION`) are dropped by `clearSessionCache()`. **Identity-scoped** keys
   (`etag-`, `inTransit-`, `fastChain-`; `MEMBER_STATE_PREFIXES_IDENTITY`) survive a re-auth. `cleanupMemberState()`
   drops both for a removed member.
+- **Timing Stats** (`timingStats`, off by default): the scheduled and async entry points (`handleSlowTimer`,
+  `fastPollMember`, `handleMemberLocationResponse`, `handleMembersResponse`) are one-line `withTiming(name) { body }`
+  wrappers around a private body; the driver call is timed the same way inside the location response.
+  Counts are approximate: two runs finishing at the same instant can drop one. Extra rows: `Reply: unchanged`
+  / `Reply: changed` (the two outcomes of a location response), `Fast tick: reschedule` (its `runIn`),
+  `Life360 wait (not hub time)` (request sent to reply received), and driver rows `Driver: HTML tile` /
+  `Driver: location history` from each device's own `TIMING` map (`timingSnapshot()`, `clearTimingStats()`),
+  summed across devices; the app turns the driver's collection on through `ctx.timingStats`. Totals live in the memory-only
+  `TIMING` map and render as a table on the app page.
 - **Memory-only** values live in the `RUNTIME` static map, keyed `"<app.id>-<name>"` (use `rtGet`/`rtSet`;
   keys must be real `String`s, since a GString hashes differently): `lastMembersPollMs` (lost on reboot means
   "refresh the roster now") and `etagChangedMs-<id>` (lost means "restart the unchanged-etag clock").

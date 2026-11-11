@@ -3,8 +3,10 @@ import java.net.SocketTimeoutException
 import groovy.transform.Field
 import java.util.concurrent.ConcurrentHashMap
 
-// Memory-only timestamps (lastMembersPollMs, lastFetch-<memberId>, forceUpdate-<memberId>, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
+// Memory-only timestamps (lastMembersPollMs, timingSinceMs, lastFetch-<memberId>, forceUpdate-<memberId>, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
 @Field static final ConcurrentHashMap RUNTIME = new ConcurrentHashMap()
+// Timing Stats, keyed "<appId>-<function>": [runs, totalMs, maxMs]. Memory-only, collected only with timingStats on.
+@Field static final ConcurrentHashMap TIMING = new ConcurrentHashMap()
 
 @Field static final int    TOKEN_EXPIRED_POLL_SECS         = 300   // slow-poll rate when token is flagged expired
 @Field static final int    AUTH_FAIL_THRESHOLD             = 3     // consecutive 401/403s before flagging token expired
@@ -182,6 +184,8 @@ def mainPage() {
             paragraph "<small style='color:#666'>Controls what appears in Hubitat's app/device logs. Turn the privacy switches OFF when sharing logs publicly.</small>"
             input(name: "logEnable", type: "bool", defaultValue: false, submitOnChange: true, title: "Enable Debug Logging", description: "Enable extra logging for debugging.")
             input(name: "logRawPayload", type: "bool", defaultValue: false, submitOnChange: true, title: "Log Raw API Diagnostics", description: "Verbose. Logs sensitive data (GPS, partial token, cookies, payloads). Debug only — don't share resulting logs.")
+            input(name: "timingStats", type: "bool", defaultValue: false, submitOnChange: true, title: "Collect Timing Stats", description: "Count and time the app's main functions, in memory only. Resets on reboot or when turned off.")
+            if (settings.timingStats) paragraph timingTable() else if (rtGet("timingSinceMs") != null) clearTiming()
             input(name: "logShowNames", type: "bool", defaultValue: true, submitOnChange: true, title: "Include Names and Places in Logs", description: "When on, logs show member/place/circle names. Turn off for privacy (UUIDs only) — useful when sharing logs for debugging.")
             input(name: "logShowMapsLink", type: "bool", defaultValue: true, submitOnChange: true, title: "Include Google Maps Link in Logs", description: "When a member moves, include a clickable Google Maps link to their coordinates in the info log. Turn off to keep coordinates out of logs.")
             input(name: "logHeartbeat", type: "bool", defaultValue: true, submitOnChange: true, title: "Heartbeat Logging")
@@ -522,7 +526,9 @@ def fetchMembers(boolean periodic = false) {
     asynchttpGet("handleMembersResponse", params, [periodic: periodic])
 }
 
-def handleMembersResponse(response, data) {
+def handleMembersResponse(response, data) { withTiming("Roster response") { onMembersResponse(response, data) } }
+
+private onMembersResponse(response, data) {
     boolean periodic = (data?.periodic == true)   // routine refreshes only log: they must not touch state.message (location-path banners live there)
     Integer status = response.status
     if (!status) {
@@ -666,7 +672,11 @@ void rtSet(String name, Long value) {
 
 String rtKey(String name) { return "${app.id}-${name}".toString() }
 
-def handleMemberLocationResponse(response, Map data) {
+def handleMemberLocationResponse(response, Map data) { withTiming("Location response") { onLocationResponse(response, data) } }
+
+private onLocationResponse(response, Map data) {
+    long tReply = new Date().getTime()
+    if (data?.sentMs) timed("Life360 wait (not hub time)", data.sentMs as long)
     String memberId = data.memberId
     Map ctx = data.ctx
 
@@ -710,6 +720,7 @@ def handleMemberLocationResponse(response, Map data) {
                 if (state.watchdogWarned) log.info("WATCHDOG: cleared — Life360 fetch succeeded again (unchanged)")
                 markFetchSuccess(memberId)
                 if (moving) ensureFastChain(memberId)   // the skipped call would have re-seeded a lost chain
+                timed("Reply: unchanged", tReply)
                 return
             }
             ctx = (ctx ?: [:]) + [staleSecs: staleSecs]   // copy: ctx is shared by every member this tick
@@ -730,6 +741,7 @@ def handleMemberLocationResponse(response, Map data) {
         if (ctx?.logRawPayload ?: getLogRawPayload()) log.trace("fetchMemberLocation: 200 member:${memberName} ${memberObj}")
         notifyChildDevice(memberId, memberObj, ctx)
         if (forced) rtSet("forceUpdate-${memberId}", null)
+        timed("Reply: changed", tReply)
         if (state.watchdogWarned) log.info("WATCHDOG: cleared — Life360 fetch succeeded again")
         markFetchSuccess(memberId)
         if (eTag && !unchanged) state["etag-${memberId}"] = eTag
@@ -1064,6 +1076,7 @@ private void removeObsoleteStateKeys() {
 def uninstalled() {
     log.info("uninstalled")
     RUNTIME.keySet().findAll { it.startsWith("${app.id}-") }.each { RUNTIME.remove(it) }
+    clearTiming()
     removeChildDevices(getChildDevices())
 }
 
@@ -1108,6 +1121,56 @@ def scheduleSlowTimer() {
     } else {
         schedule("0 */${(baseSecs / SECS_PER_MIN).toInteger()} * * * ? *", handleSlowTimer)
     }
+}
+
+// runs c and adds its time to the Timing Stats under name
+private withTiming(String name, Closure c) {
+    long t0 = new Date().getTime()
+    try { return c() } finally { timed(name, t0) }
+}
+
+// approximate: two runs finishing at the same instant can drop one count
+private void timed(String name, long startMs) {
+    if (settings.timingStats != true) return
+    long ms = new Date().getTime() - startMs
+    String key = rtKey(name)
+    TIMING[key] = mergeTiming(TIMING[key] as List, [1L, ms, ms])
+    if (rtGet("timingSinceMs") == null) {   // first sample of a new window: drop driver rows left by in-flight replies
+        clearDriverTiming()
+        rtSet("timingSinceMs", new Date().getTime())
+    }
+}
+
+// [runs, totalMs, maxMs] + [runs, totalMs, maxMs]
+private static List mergeTiming(List a, List b) {
+    if (a == null) return b
+    return [(a[0] as long) + (b[0] as long), (a[1] as long) + (b[1] as long), Math.max(a[2] as long, b[2] as long)]
+}
+
+private void clearDriverTiming() {
+    getChildDevices()?.each { dev -> try { dev.clearTimingStats() } catch (ignored) {} }
+}
+
+private void clearTiming() {
+    TIMING.keySet().findAll { it.startsWith(rtKey("")) }.each { TIMING.remove(it) }
+    rtSet("timingSinceMs", null)
+    clearDriverTiming()
+}
+
+private String timingTable() {
+    String prefix = rtKey("")
+    Map agg = [:]
+    TIMING.findAll { k, v -> k.startsWith(prefix) }.each { k, v -> agg[k.substring(prefix.length())] = v }
+    getChildDevices()?.each { dev ->   // driver rows, summed over every member device
+        try { dev.timingSnapshot()?.each { n, v -> agg[n] = mergeTiming(agg[n] as List, v as List) } } catch (ignored) {}
+    }
+    def rows = agg.collect { n, v -> [name: n, runs: v[0] as long, total: v[1] as long, max: v[2] as long] }
+        .sort { a, b -> (a.name.startsWith("Life360 wait") <=> b.name.startsWith("Life360 wait")) ?: (b.total <=> a.total) }
+    if (!rows) return "<small style='color:#666'>No timings yet: they appear after the next poll.</small>"
+    Long since = rtGet("timingSinceMs")
+    String html = "<small style='color:#666'>Since ${since ? new Date(since).format('MMM d HH:mm', location.timeZone) : '?'}. Reply rows and Device update run inside Location response; Driver rows run inside Device update; Fast tick: reschedule runs inside Fast tick.</small><table style='font-size:12px'><tr><th align=left>Function</th><th>Runs</th><th>Total s</th><th>Avg ms</th><th>Max ms</th></tr>"
+    rows.each { html += "<tr><td>${it.name}</td><td align=right>${it.runs}</td><td align=right>${sprintf('%.1f', it.total / 1000.0)}</td><td align=right>${it.runs ? (long)(it.total / it.runs) : 0}</td><td align=right>${it.max}</td></tr>" }
+    return html + "</table>"
 }
 
 // poll-rate accessors — single source of truth for the UI defaults so the fallback can't drift
@@ -1157,7 +1220,9 @@ private void ensureFastChain(String memberId) {
  * transit (and dynamic polling stays eligible); otherwise the chain ends and the member rejoins
  * the slow poll. Re-arm happens before the async fetch so a fetch failure can't break the chain.
  */
-def fastPollMember(data) {
+def fastPollMember(data) { withTiming("Fast tick") { fastTick(data) } }
+
+private fastTick(data) {
     // memberId round-trips through runIn's serialized data map — coerce to a plain String so the
     // settings.users.contains() membership check below can't silently fail on a CharSequence type.
     String memberId = data?.memberId?.toString()
@@ -1166,7 +1231,7 @@ def fastPollMember(data) {
         && settings.users?.contains(memberId))
 
     if (keepGoing) {
-        runIn(dynamicPollFreqSecs(), "fastPollMember", [data: [memberId: memberId], overwrite: false])
+        withTiming("Fast tick: reschedule") { runIn(dynamicPollFreqSecs(), "fastPollMember", [data: [memberId: memberId], overwrite: false]) }
     } else {  // chain ends here — member stopped, deselected, or dynamic disabled
         state.remove("fastChain-${memberId}")
         if (logEnable) log.debug("fastPollMember: member:${memberDisplayName(memberId)}: chain ended, rejoining slow poll")
@@ -1184,7 +1249,9 @@ private void resetWatchdog() {
 /**
  * SLOW timer callback — watchdog + roster/heartbeat refresh + full member poll.
  */
-def handleSlowTimer() {
+def handleSlowTimer() { withTiming("Slow tick") { slowTick() } }
+
+private slowTick() {
     // watchdog: if we haven't had a successful fetch in a long time, surface it loudly.
     // Threshold = max(pollFreq * 10, 10 minutes). state.message is rendered on mainPage,
     // and a log.warn shows up in Hubitat's main log so the user can see something is wrong
@@ -1345,6 +1412,7 @@ def syncChildDevices() {
         if (!wantedDnis.contains(dni)) {
             log.info "syncChildDevices: removing orphan child: ${child.displayName} (${dni})"
             try {
+                try { child.clearTimingStats() } catch (ignored) {}
                 deleteChildDevice(dni)
                 String memberId = dni.contains('.') ? dni.substring(dni.indexOf('.') + 1) : dni
                 cleanupMemberState(memberId)
@@ -1407,7 +1475,7 @@ def notifyChildDevice(memberId, memberObj, Map ctx = null) {
         def deviceWrapper = getChildDevice("${externalId}")
         if (deviceWrapper != null) {
             // send location and home to device driver
-            boolean inTransit = deviceWrapper.generatePresenceEvent(memberObj, null, home, ctx)  // places arg unused by driver; kept for the frozen app↔driver signature
+            boolean inTransit = withTiming("Device update") { deviceWrapper.generatePresenceEvent(memberObj, null, home, ctx) }  // places arg unused by driver; kept for the frozen app↔driver signature
             boolean prevInTransit = isMemberInTransit(memberId)
             boolean transitFlipped = (prevInTransit != inTransit)
             if (transitFlipped) {
@@ -1440,6 +1508,7 @@ private Map buildPollContext() {
     ctx.logRawPayload = getLogRawPayload()
     ctx.logDrivingTransitions = getLogDrivingTransitions()
     ctx.parkedClamp  = (settings.parkedClamp == true)   // the app's Early Parked Detection default
+    ctx.timingStats  = (settings.timingStats == true)
     return ctx
 }
 

@@ -14,6 +14,7 @@
 
 import java.text.SimpleDateFormat
 import groovy.transform.Field
+import java.util.concurrent.ConcurrentHashMap
 
 @Field static final int    HUBITAT_TILE_MAX_CHARS  = 1024    // Hubitat dashboard tile character limit
 @Field static final int    MAX_HISTORY_ENTRIES     = 100     // max location history entries kept in state
@@ -170,6 +171,29 @@ def updated() {
     refresh()
 }
 
+// Timing Stats for this device, keyed "<deviceId>-<name>": [runs, totalMs, maxMs]; collected only when ctx.timingStats is on
+@Field static final ConcurrentHashMap TIMING = new ConcurrentHashMap()
+
+private void timed(Map ctx, String name, long startMs) {
+    if (ctx?.timingStats != true) return
+    long ms = new Date().getTime() - startMs
+    String key = "${device.id}-${name}".toString()
+    List t = (TIMING[key] ?: [0L, 0L, 0L]) as List
+    TIMING[key] = [(t[0] as long) + 1L, (t[1] as long) + ms, Math.max(t[2] as long, ms)]
+}
+
+// called by the app's Timing Stats table
+Map timingSnapshot() {
+    String p = "${device.id}-"
+    return TIMING.findAll { k, v -> k.startsWith(p) }.collectEntries { k, v -> [(k.substring(p.length())): v] }
+}
+
+// called by the app when Timing Stats is turned off
+void clearTimingStats() {
+    String p = "${device.id}-"
+    TIMING.keySet().findAll { it.startsWith(p) }.each { TIMING.remove(it) }
+}
+
 // called by the app's cleanup: clear attributes a later version removed
 void removeObsoleteAttributes(List<String> names) {
     names?.each { device.deleteCurrentState(it) }   // no-op when absent
@@ -295,7 +319,9 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     // *** Location History (only when lat/lng actually changed) ***
     if (saveHistory && (prevLatitude == null || prevLatitude != latitude
         || prevLongitude == null || prevLongitude != longitude)) {
+        long tHist = new Date().getTime()
         saveLocationHistory(latitude, longitude, lastUpdated.getTime())
+        timed(ctx, "Driver: location history", tHist)
     }
 
     // Update status attribute with appropriate distance units
@@ -408,6 +434,7 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     if (!generateHtml) {
         return inTransit
     }
+    long tHtml = new Date().getTime()
 
     if (avatarHtml != device.currentValue("avatarHtml")) sendEvent(name: "avatarHtml", value: avatarHtml)
 
@@ -439,6 +466,7 @@ boolean generatePresenceEvent(member, thePlaces, home, Map ctx = null) {
     int tileDevice1Count = tileMap.length()
     if (tileDevice1Count > HUBITAT_TILE_MAX_CHARS) log.warn "generatePresenceEvent: Too many characters to display on Dashboard (${tileDevice1Count})"
     sendEvent(name: "html", value: tileMap, displayed: true)
+    timed(ctx, "Driver: HTML tile", tHtml)
     return inTransit
 }
 
