@@ -3,7 +3,7 @@ import java.net.SocketTimeoutException
 import groovy.transform.Field
 import java.util.concurrent.ConcurrentHashMap
 
-// Memory-only timestamps (lastMembersPollMs, timingSinceMs, lastFetch-<memberId>, forceUpdate-<memberId>, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
+// Memory-only values (lastMembersPollMs, fastTimerOn, inTransit-<memberId>, timingSinceMs, lastFetch-<memberId>, forceUpdate-<memberId>, etagChangedMs-<memberId>, locTs-<memberId>, noEtagWarnMs), keyed "<appId>-<name>" (use rtGet/rtSet). Lost on reboot, which is right: the roster refreshes and the unchanged-etag clock restarts.
 @Field static final ConcurrentHashMap RUNTIME = new ConcurrentHashMap()
 // Timing Stats, keyed "<appId>-<function>": [runs, totalMs, maxMs]. Memory-only, collected only with timingStats on.
 @Field static final ConcurrentHashMap TIMING = new ConcurrentHashMap()
@@ -30,7 +30,7 @@ import java.util.concurrent.ConcurrentHashMap
 // and reboot (clearSessionCache); IDENTITY keys, including etags, outlive both. Removing a member drops
 // both (cleanupMemberState). Single source of truth so the two cleanup paths can't drift.
 @Field static final List<String> MEMBER_STATE_PREFIXES_SESSION  = ["transientCount-", "transientUntilMs-"]
-@Field static final List<String> MEMBER_STATE_PREFIXES_IDENTITY = ["etag-", "inTransit-", "fastChain-"]
+@Field static final List<String> MEMBER_STATE_PREFIXES_IDENTITY = ["etag-", "inTransit-"]
 
 // 5xx statuses that are a permanent server-side "no" rather than a blip worth retrying. Every
 // other 5xx — Life360 origin 500/502/503/504 and the Cloudflare edge codes 520-530 — heals on
@@ -616,11 +616,11 @@ boolean fetchLocations(boolean routine = false) {
     def ctx = buildPollContext()   // shared across all member fetches this tick
 
     settings.users.each { memberId ->
-        // a slow tick skips a member the fast chain polled a moment ago; if the chain dies, the next slow tick polls them again
-        if (routine && state["fastChain-${memberId}"]) {
+        // a slow tick skips a member the fast timer polled a moment ago; if it stops, the next slow tick polls them again
+        if (routine) {
             long agoMs = currentTimeMs - (rtGet("lastFetch-${memberId}") ?: 0L)
             if (agoMs < dynamicPollFreqSecs() * 2000L) {
-                if (logEnable) log.debug("fetchLocations: member:${memberDisplayName(memberId)}: fast chain polled ${(long)(agoMs / 1000L)}s ago, skipping slow-tick poll")
+                if (logEnable) log.debug("fetchLocations: member:${memberDisplayName(memberId)}: fast timer polled ${(long)(agoMs / 1000L)}s ago, skipping slow-tick poll")
                 return
             }
         }
@@ -632,7 +632,7 @@ boolean fetchLocations(boolean routine = false) {
 
 def fetchMemberLocation(memberId, Map ctx = null) {
     long startMs = new Date().getTime()
-    // honor a server-driven rate-limit window (429) here too: the 20-second fast chain calls this directly and would
+    // honor a server-driven rate-limit window (429) here too: the fast timer calls this directly and would
     // otherwise keep requesting, and keep extending the window, while Life360 is already refusing us
     if (state.rateLimitedUntilMs && startMs < state.rateLimitedUntilMs) {
         if (logEnable) log.debug("fetchMemberLocation: member:${memberDisplayName(memberId)}: rate-limited for ${(long)((state.rateLimitedUntilMs - startMs) / 1000L)}s, skipping")
@@ -719,7 +719,6 @@ private onLocationResponse(response, Map data) {
                 if (logEnable) log.debug("fetchMemberLocation: SUCCESS (200, etag unchanged -> treated as 304), member:${memberName}")
                 if (state.watchdogWarned) log.info("WATCHDOG: cleared — Life360 fetch succeeded again (unchanged)")
                 markFetchSuccess(memberId)
-                if (moving) ensureFastChain(memberId)   // the skipped call would have re-seeded a lost chain
                 timed("Reply: unchanged", tReply)
                 return
             }
@@ -1065,7 +1064,7 @@ def initialize(evt) {
 private void removeObsoleteStateKeys() {
     ["placesJson", "cachedHome", "scheduledBaseSecs", "pollIntervalSecs",
      "dynamicPollingActive", "memberInTransit", "lastCirclesFetchMs", "lastCirclesPollMs", "memberCount"].each { state.remove(it) }
-    removeStateKeysWithPrefix(["inflight-"])  // in-flight markers written to state by earlier versions
+    removeStateKeysWithPrefix(["inflight-", "fastChain-"])  // in-flight and per-member fast-chain markers from earlier versions
     List<String> obsoleteAttributes = ["isMoving"]   // device attributes removed in later versions
     getChildDevices()?.each { dev ->
         try { dev.removeObsoleteAttributes(obsoleteAttributes) } catch (e) { log.warn("removeObsoleteStateKeys: ${dev.displayName} could not clear old attributes: ${e}") }
@@ -1092,14 +1091,12 @@ def refresh() {
  * Arm the SLOW timer — the steady-state poll that fetches every selected member, refreshes
  * the roster/heartbeat, and runs the watchdog. Fires at the user's Default Refresh Rate
  * (settings.pollFreq), or every 5 min while the token is flagged expired (probe-only).
- * Members in motion are additionally polled by per-member runIn chains (see ensureFastChain).
+ * Members in motion are additionally polled by one shared fast timer (see ensureFastTimer).
  */
 def scheduleSlowTimer() {
-    // Full clean rebuild. No-arg unschedule() clears EVERY job — slow timer, all fast-poll
-    // chains, any legacy timer. Those chains can't survive this, so drop every fastChain- marker
-    // (not just current users — unschedule killed them all); the next slow tick re-seeds movers.
+    // Full clean rebuild: no-arg unschedule() clears every job, including the fast timer; the next slow tick restarts it for movers.
     unschedule()
-    removeStateKeysWithPrefix(["fastChain-"])
+    rtSet("fastTimerOn", null)
 
     // Re-arm the repeat reminder JOB if the token is flagged expired — unschedule() above killed
     // it. Only re-arms the timer; it does NOT re-send device alerts, so a reboot/refresh while
@@ -1116,11 +1113,7 @@ def scheduleSlowTimer() {
 
     log.info("scheduleSlowTimer: baseSecs:${baseSecs}, pollFreq:${settings.pollFreq}, dynamicPolling:${settings.dynamicPolling}, dynamicPollFreq:${settings.dynamicPollFreq}")
 
-    if (baseSecs < SECS_PER_MIN) {
-        schedule("0/${baseSecs} * * * * ? *", handleSlowTimer)
-    } else {
-        schedule("0 */${(baseSecs / SECS_PER_MIN).toInteger()} * * * ? *", handleSlowTimer)
-    }
+    schedule(cronForSecs(baseSecs), handleSlowTimer)
 }
 
 // runs c and adds its time to the Timing Stats under name
@@ -1168,7 +1161,7 @@ private String timingTable() {
         .sort { a, b -> (a.name.startsWith("Life360 wait") <=> b.name.startsWith("Life360 wait")) ?: (b.total <=> a.total) }
     if (!rows) return "<small style='color:#666'>No timings yet: they appear after the next poll.</small>"
     Long since = rtGet("timingSinceMs")
-    String html = "<small style='color:#666'>Since ${since ? new Date(since).format('MMM d HH:mm', location.timeZone) : '?'}. Reply rows and Device update run inside Location response; Driver rows run inside Device update; Fast tick: reschedule runs inside Fast tick.</small><table style='font-size:12px'><tr><th align=left>Function</th><th>Runs</th><th>Total s</th><th>Avg ms</th><th>Max ms</th></tr>"
+    String html = "<small style='color:#666'>Since ${since ? new Date(since).format('MMM d HH:mm', location.timeZone) : '?'}. Reply rows and Device update run inside Location response; Driver rows run inside Device update.</small><table style='font-size:12px'><tr><th align=left>Function</th><th>Runs</th><th>Total s</th><th>Avg ms</th><th>Max ms</th></tr>"
     rows.each { html += "<tr><td>${it.name}</td><td align=right>${it.runs}</td><td align=right>${sprintf('%.1f', it.total / 1000.0)}</td><td align=right>${it.runs ? (long)(it.total / it.runs) : 0}</td><td align=right>${it.max}</td></tr>" }
     return html + "</table>"
 }
@@ -1190,56 +1183,50 @@ private boolean parkedClampOn(memberId) {
 }
 
 /**
- * Whether the per-member fast-poll chains should run at all: dynamic polling enabled, the
- * dynamic rate actually faster than the default rate, and the token healthy. Member-specific
- * conditions (in-transit, still selected) are checked by the callers on top of this.
+ * Whether the fast timer should run at all: dynamic polling enabled, the dynamic rate actually
+ * faster than the default rate, and the token healthy. The fast tick picks who is in transit.
  */
 private boolean fastPollEligible() {
     int dyn = dynamicPollFreqSecs()
     return (settings.dynamicPolling && dyn > 0 && pollFreqSecs() > dyn && !state.tokenLikelyExpired)
 }
 
-/**
- * Start a per-member fast-poll chain if one isn't already running for this member. Called when
- * the slow poll (via notifyChildDevice) sees a member in transit. The fastChain-<id> marker
- * prevents stacking duplicate chains; it's set only AFTER runIn succeeds so a throwing schedule
- * can't strand the marker true (which would block all future chains for that member).
- */
-private void ensureFastChain(String memberId) {
-    if (isEmpty(memberId) || !fastPollEligible()) return
-    if (state["fastChain-${memberId}"]) return   // chain already running for this member
-
+// starts the one recurring fast job if it isn't armed; it polls every member in transit
+private void ensureFastTimer() {
+    if (rtGet("fastTimerOn") != null || !fastPollEligible()) return
     int dyn = dynamicPollFreqSecs()
-    if (logEnable) log.debug("ensureFastChain: member:${memberDisplayName(memberId)}: starting fast chain @ ${dyn}s")
-    runIn(dyn, "fastPollMember", [data: [memberId: memberId], overwrite: false])
-    state["fastChain-${memberId}"] = true
+    if (logEnable) log.debug("ensureFastTimer: fast polling every ${dyn}s")
+    unschedule("handleFastTimer")
+    schedule(cronForSecs(dyn), handleFastTimer)
+    rtSet("fastTimerOn", 1L)
 }
 
-/**
- * Per-member fast-poll chain tick. Fetches one member, then re-arms ONLY while they remain in
- * transit (and dynamic polling stays eligible); otherwise the chain ends and the member rejoins
- * the slow poll. Re-arm happens before the async fetch so a fetch failure can't break the chain.
- */
-def fastPollMember(data) { withTiming("Fast tick") { fastTick(data) } }
+private void stopFastTimer(String why) {
+    unschedule("handleFastTimer")
+    rtSet("fastTimerOn", null)
+    if (logEnable) log.debug("fastTick: ${why}, fast polling stopped")
+}
 
-private fastTick(data) {
-    // memberId round-trips through runIn's serialized data map — coerce to a plain String so the
-    // settings.users.contains() membership check below can't silently fail on a CharSequence type.
-    String memberId = data?.memberId?.toString()
-    if (isEmpty(memberId)) return
-    boolean keepGoing = (fastPollEligible() && isMemberInTransit(memberId)
-        && settings.users?.contains(memberId))
+def handleFastTimer() { withTiming("Fast tick") { fastTick() } }
 
-    if (keepGoing) {
-        withTiming("Fast tick: reschedule") { runIn(dynamicPollFreqSecs(), "fastPollMember", [data: [memberId: memberId], overwrite: false]) }
-    } else {  // chain ends here — member stopped, deselected, or dynamic disabled
-        state.remove("fastChain-${memberId}")
-        if (logEnable) log.debug("fastPollMember: member:${memberDisplayName(memberId)}: chain ended, rejoining slow poll")
+private fastTick() {
+    if (!fastPollEligible()) { stopFastTimer("fast polling not eligible"); return }
+    List movers = settings.users?.findAll { isMemberInTransit(it) }
+    if (!movers) {
+        stopFastTimer("nobody in transit")
+        return
     }
+    long nowMs = new Date().getTime()
+    if (state.rateLimitedUntilMs && nowMs < state.rateLimitedUntilMs) return   // 429 window: keep ticking, send nothing
     def ctx = buildPollContext()
-    rtSet("lastFetch-${memberId}", new Date().getTime())   // only the chain's polls count for the slow-tick skip
-    fetchMemberLocation(memberId, ctx)
+    movers.each { memberId ->
+        rtSet("lastFetch-${memberId}", nowMs)   // only fast polls count for the slow-tick skip
+        fetchMemberLocation(memberId, ctx)
+    }
 }
+
+// a runIn left pending by a version with per-member chains
+def fastPollMember(data) { if (isMemberInTransit(data?.memberId?.toString())) ensureFastTimer() }
 
 private void resetWatchdog() {
     if (state.watchdogWarned) state.watchdogWarned = false   // re-arm the rising-edge warning
@@ -1291,6 +1278,7 @@ private slowTick() {
         return
     }
 
+    if (settings.users?.any { isMemberInTransit(it) }) ensureFastTimer()   // the one re-arm point: after Done, a reboot or a failed fetch
     if (!fetchLocations(true)) return
 }
 
@@ -1435,12 +1423,13 @@ private void cleanupMemberState(String memberId) {
     rtSet("locTs-${memberId}", null)
     rtSet("lastFetch-${memberId}", null)
     rtSet("forceUpdate-${memberId}", null)
+    rtSet("inTransit-${memberId}", null)
 }
 
 /**
  * Remove every state key whose name starts with one of the given prefixes, across all members.
- * Used when a class of per-member keys must be dropped wholesale (e.g. fast-poll chain markers
- * after unschedule(), or session keys after an auth failure).
+ * Used when a class of per-member keys must be dropped wholesale (e.g. session keys after an
+ * auth failure, or keys left by an older version).
  */
 private void removeStateKeysWithPrefix(List<String> prefixes) {
     def toRemove = state.keySet().findAll { k ->
@@ -1476,16 +1465,12 @@ def notifyChildDevice(memberId, memberObj, Map ctx = null) {
         if (deviceWrapper != null) {
             // send location and home to device driver
             boolean inTransit = withTiming("Device update") { deviceWrapper.generatePresenceEvent(memberObj, null, home, ctx) }  // places arg unused by driver; kept for the frozen app↔driver signature
-            boolean prevInTransit = isMemberInTransit(memberId)
-            boolean transitFlipped = (prevInTransit != inTransit)
-            if (transitFlipped) {
+            if ((state["inTransit-${memberId}"] == true) != inTransit) {   // compared with state itself, so a lost write is repaired next reply
                 if (logEnable) log.debug("notifyChildDevice: ${showNamesInLogs() ? memberObj.firstName : memberId}: state changed: inTransit:${inTransit}")
                 state["inTransit-${memberId}"] = inTransit
             }
-            // Re-seed even without a transit flip: after a reboot the runIn chain is gone but
-            // inTransit- persists, so this restarts it on the next slow tick. ensureFastChain
-            // no-ops if a chain is already running or dynamic is ineligible.
-            if (inTransit && settings.dynamicPolling) ensureFastChain(memberId)
+            rtSet("inTransit-${memberId}", inTransit ? 1L : 0L)
+            if (inTransit) ensureFastTimer()   // no-op while armed or ineligible
         } else {
             log.error("notifyChildDevice: device not found: ${externalId}")
         }
@@ -1614,9 +1599,15 @@ void clearSessionCache() {
     removeStateKeysWithPrefix(MEMBER_STATE_PREFIXES_SESSION)
 }
 
+// memory first (current at once, even before an async handler's state is saved), state after a reboot
 boolean isMemberInTransit(memberId) {
-    def inTransit = state["inTransit-${memberId}"]
-    return inTransit != null && inTransit
+    Long m = rtGet("inTransit-${memberId}")
+    return m != null ? m == 1L : (state["inTransit-${memberId}"] == true)
+}
+
+// cron for a repeat every secs seconds (under a minute) or whole minutes
+private static String cronForSecs(int secs) {
+    return secs < SECS_PER_MIN ? "0/${secs} * * * * ? *" : "0 */${(int)(secs / SECS_PER_MIN)} * * * ? *"
 }
 
 // ----------------------------------------------------------------------------

@@ -86,12 +86,12 @@ the `Cookie` header from `state.cookies`.
 
 ## 2. Architecture
 
-Three cadences, all driven from the single `handleSlowTimer` scheduled job plus per-member `runIn` chains:
+Three cadences, all driven from the `handleSlowTimer` scheduled job plus one shared fast timer:
 
 - **Slow timer** (`handleSlowTimer`) at the user's Default Refresh Rate (`pollFreq`): watchdog, then the
   roster refresh, then `fetchLocations()` (or the token probe while the token is flagged).
-- **Per-member fast-poll chains** (`ensureFastChain` / `fastPollMember`) at `dynamicPollFreq` for members
-  in transit, when dynamic polling is on (§4.3).
+- **One shared fast timer** (`ensureFastTimer` / `handleFastTimer`) at `dynamicPollFreq` that polls every
+  member in transit, when dynamic polling is on (§4.3).
 - **Roster refresh** (`fetchMembers(true)`), floored at 15 minutes, riding the slow tick (§4.2).
 
 Other entry points: the Done button (`updated()`), `refresh()` (driver Refresh / preference save),
@@ -167,10 +167,9 @@ token and the cookie jar are independent gates: both must be valid.
 `fetchLocations()` runs on each slow tick, the Fetch Locations button, `refresh()`, and after a force-update.
 It builds one shared `ctx` map (home place, cookies, `showNames`, `showMapsLink`, `useMiles`, log flags)
 and fires one `asynchttpGet` per selected member. `fetchMemberLocation()` skips a member inside its
-transient-backoff window, and everything while a `429` window is open (this also stops the 20 s fast chain).
-On a slow tick (`fetchLocations(true)`) a member with a `fastChain-<id>` marker whose memory-only `lastFetch-<id>`
-(stamped only by `fastPollMember`) is under two fast intervals old is skipped; a dead chain stops refreshing it,
-so the next slow tick polls them.
+transient-backoff window, and everything while a `429` window is open (this also covers the fast timer's polls).
+On a slow tick (`fetchLocations(true)`) a member whose memory-only `lastFetch-<id>` (stamped only by the fast
+timer) is under two fast intervals old is skipped; if the fast timer stops, the next slow tick polls them.
 
 `handleMemberLocationResponse` on a `200`:
 
@@ -179,18 +178,17 @@ so the next slow tick polls them.
   The header is read **case-insensitively** (`headers.find { it.key?.equalsIgnoreCase("l360-etag") }`),
   because the async headers Map is case-sensitive.
 - Unchanged and not in transit, or unchanged for less than `STALE_ETAG_SECS` (240 s): no parse,
-  no driver call; `markFetchSuccess`; for a moving member `ensureFastChain` is called so a lost chain
-  comes back.
+  no driver call; `markFetchSuccess`.
 - Unchanged, in transit, and past that window: one driver call with `ctx + [staleSecs: n]` (a copy, since
   `ctx` is shared across members) only when Early Parked Detection is on for that member (`parkedClampOn`);
-  if the last speed is under 3.5 mph the driver returns false and the fast chain ends, otherwise it stays in
+  if the last speed is under 3.5 mph the driver returns false and fast polling ends, otherwise it stays in
   transit and is re-checked next window (§13). Off, the poll is handled like any unchanged one.
 - Changed (or no etag was sent): parse, `notifyChildDevice`, `markFetchSuccess`, store the etag. The
   `etagChangedMs-<id>` clock (memory-only) restarts.
 - The stored etags are only cleared when a member is removed or its device is recreated. Done, `refresh()`,
   Fetch Locations and Fetch Places set a memory-only `forceUpdate-<id>` per member instead, so the next poll
   reaches each device once even when unchanged (changed settings, a new home place) while the etag, and with
-  it the parked state, is kept. `refresh()` does not touch the schedule, so fast chains survive a Refresh.
+  it the parked state, is kept. `refresh()` does not touch the schedule, so fast polling survives a Refresh.
 
 `markFetchSuccess(memberId)` clears `failCount`, `tokenLikelyExpired`, `rateLimitedUntilMs`, `message`,
 `watchdogWarned` and that member's backoff, and stamps `lastSuccessMs`, skipping every write that would
@@ -198,7 +196,7 @@ change nothing.
 
 `notifyChildDevice` calls `generatePresenceEvent(member, null, home, ctx)` on the member's child device
 (DNI `"<app.id>.<memberId>"`), stores the returned boolean in `state["inTransit-<id>"]`, and, when it is
-true and dynamic polling is on, calls `ensureFastChain`. `home` is resolved once per tick by
+true, calls `ensureFastTimer` (a no-op unless fast polling is eligible). `home` is resolved once per tick by
 `buildPlacesContext()`; the driver uses only `home`.
 
 ### 4.2 Roster refresh
@@ -219,18 +217,25 @@ true and dynamic polling is on, calls `ensureFastChain`. `home` is resolved once
 
 ### 4.3 Dynamic polling (optional)
 
-With `dynamicPolling` on and `dynamicPollFreq < pollFreq`, a member in transit also gets a per-member
-`runIn` chain at `dynamicPollFreq` while the slow timer keeps polling everyone at `pollFreq`.
+With `dynamicPolling` on and `dynamicPollFreq < pollFreq`, one recurring fast job polls every member in
+transit at `dynamicPollFreq`, while the slow timer keeps polling everyone at `pollFreq`.
 
-- `ensureFastChain(id)`: no-op unless `fastPollEligible()` (dynamic on, dynamic rate faster than the default
-  rate, token healthy) and no `fastChain-<id>` marker; schedules `fastPollMember`, then sets the marker
-  (after `runIn` succeeds, so a throw can't strand it).
-- `fastPollMember(data)`: re-arms **before** the fetch so a failure can't break the chain, only while the
-  member is still in transit, selected and eligible; otherwise removes the marker. Then fetches the member.
-- `scheduleSlowTimer()` runs `unschedule()` (kills every job) and clears all `fastChain-*` markers; the next
-  slow tick re-seeds movers. Callers are listed in §4.5.
-- The slow tick skips a mover the chain polled within two fast intervals (§4.1), so a mover gets one request
-  per fast interval, not two.
+- `ensureFastTimer()`: no-op while the memory-only `fastTimerOn` is set or `fastPollEligible()` is false
+  (dynamic on, dynamic rate faster than the default rate, token healthy); otherwise
+  `schedule(cronForSecs(dyn), handleFastTimer)` and sets the flag. It is called from two places: `notifyChildDevice` when a member is
+  in transit (starts fast polling promptly), and every slow tick when anyone is in transit (the one re-arm
+  point after Done, a reboot, `scheduleSlowTimer()` or a failed fetch). It replaced per-member `runIn` chains in 5.2.6: re-arming every tick cost about 20 ms of
+  scheduler work, roughly 16% of all app time (Timing Stats, 2026-11-11 to 11-13).
+- `handleFastTimer()`: polls every member `isMemberInTransit()` reports, stamping `lastFetch-<id>`; with
+  nobody in transit, or fast polling ineligible, `stopFastTimer()` unschedules it; inside a 429 window it
+  sends nothing. `isMemberInTransit()` reads a memory copy first (written with every driver return, so a
+  reply whose state hasn't been saved yet is still seen), falling back to `state` after a reboot. No state
+  is written.
+- `fastPollMember(data)` stays as a stub that calls `ensureFastTimer()`, for a `runIn` left by an older version.
+- `scheduleSlowTimer()` runs `unschedule()` (kills every job, including the fast timer) and clears
+  `fastTimerOn`; the next slow tick restarts it for movers. Callers are listed in §4.5.
+- The slow tick skips a mover the fast timer polled within two fast intervals (§4.1), so a mover gets one
+  request per fast interval, not two.
 
 ### 4.4 Child devices
 
@@ -244,7 +249,7 @@ entries and removes the child devices.
 ### 4.5 Scheduler
 
 `scheduleSlowTimer()` is the single entry point (`installed`, `updated`, `initialize`, the auth-failure rising
-edge, token recovery). It always does a full rebuild: `unschedule()`, clear `fastChain-*`, re-arm the
+edge, token recovery). It always does a full rebuild: `unschedule()`, clear `fastTimerOn`, re-arm the
 token-expiry reminder if the token is flagged (the reminder job dies in `unschedule()`), then
 `schedule()` at `pollFreq` (300 s while the token is flagged; none when `pollFreq` is 0 = Disabled; cron
 seconds below 60 s, minutes otherwise). There is no no-op guard, so there is no hidden schedule state.
@@ -262,7 +267,7 @@ Each member fetch is judged independently; a few **account-level** flags are sha
 | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `200`                                      | §4.1. `markFetchSuccess`.                                                                                                                                                                                                                                                                                                               |
 | `401`/`403`                                | **Account-level:** `clearSessionCache()`, `failCount++`; at ≥3 set `tokenLikelyExpired`, then `scheduleSlowTimer()` (slows to 300 s) **before** `notifyTokenExpired()`. **Order matters:** `scheduleSlowTimer()` calls `unschedule()`, which would cancel the reminder job `notifyTokenExpired()` registers. Below 3, a transient "will retry" banner. |
-| `429`                                      | **Account-level:** `rateLimitedUntilMs = now + min(Retry-After ?: 60, 900) + 10 s`; Done clears it (kept with `Math.max`); pauses every fetch including the fast chain.                                                                                                                                                                                       |
+| `429`                                      | **Account-level:** `rateLimitedUntilMs = now + min(Retry-After ?: 60, 900) + 10 s`; Done clears it (kept with `Math.max`); pauses every fetch including the fast timer's.                                                                                                                                                                                       |
 | `408`, any `5xx` except `501`/`505`, network error (no status) | **Per-member** exponential backoff (below).                                                                                                                                                                                                                                                                  |
 | other                                      | Log an error and set a banner.                                                                                                                                                                                                                                                                                                          |
 
@@ -289,7 +294,7 @@ same account-level updates.
 (never/2/6/12/24/48 h) while the flag stays set, and are cancelled by Done and by recovery.
 
 **`clearSessionCache()`** removes `cookies` and the session-scoped keys (`transientCount-*`,
-`transientUntilMs-*`). Identity keys (`etag-*`, `inTransit-*`, `fastChain-*`) survive so transit state isn't lost on a
+`transientUntilMs-*`). Identity keys (`etag-*`, `inTransit-*`) survive so transit state isn't lost on a
 mere token re-paste. `initialize()` calls it first, dropping caches left from before a reboot.
 
 **Banner copy.** Self-resolving conditions (429, transient 5xx, sub-threshold auth) use lowercase "will retry
@@ -396,13 +401,13 @@ skipped. Lat/lng are rounded to 5 decimals. The separate `bpt-history` / `numOfC
 
 - **Session-scoped** per-member keys (`transientCount-`, `transientUntilMs-`; list
   `MEMBER_STATE_PREFIXES_SESSION`) are dropped by `clearSessionCache()`. **Identity-scoped** keys
-  (`etag-`, `inTransit-`, `fastChain-`; `MEMBER_STATE_PREFIXES_IDENTITY`) survive a re-auth. `cleanupMemberState()`
+  (`etag-`, `inTransit-`; `MEMBER_STATE_PREFIXES_IDENTITY`) survive a re-auth. `cleanupMemberState()`
   drops both for a removed member.
 - **Timing Stats** (`timingStats`, off by default): the scheduled and async entry points (`handleSlowTimer`,
-  `fastPollMember`, `handleMemberLocationResponse`, `handleMembersResponse`) are one-line `withTiming(name) { body }`
+  `handleFastTimer`, `handleMemberLocationResponse`, `handleMembersResponse`) are one-line `withTiming(name) { body }`
   wrappers around a private body; the driver call is timed the same way inside the location response.
   Counts are approximate: two runs finishing at the same instant can drop one. Extra rows: `Reply: unchanged`
-  / `Reply: changed` (the two outcomes of a location response), `Fast tick: reschedule` (its `runIn`),
+  / `Reply: changed` (the two outcomes of a location response),
   `Life360 wait (not hub time)` (request sent to reply received), and driver rows `Driver: HTML tile` /
   `Driver: location history` from each device's own `TIMING` map (`timingSnapshot()`, `clearTimingStats()`),
   summed across devices; the app turns the driver's collection on through `ctx.timingStats`. Totals live in the memory-only
@@ -476,7 +481,7 @@ Hubitat has no local test harness: install on a real hub against a real circle a
 3. **Unchanged-etag skip:** an idle member logs `SUCCESS (200, etag unchanged -> treated as 304)` and the
    driver runs only when its data changes. A moving member's unchanged polls skip the same way; after 240 s
    without a changed etag while still `inTransit`, with Early Parked Detection on, debug logging shows
-   `no new Life360 data for Ns at N mph; Early Parked Detection: inTransit false` and the fast chain ends; a
+   `no new Life360 data for Ns at N mph; Early Parked Detection: inTransit false` and fast polling ends; a
    later 0 mph "in transit" fix logs `Early Parked Detection: still parked`.
 4. **Before any in-place release (§7.3):** diff the driver's attribute, capability, command and preference
    names and the app's setting names against the previous version; new entries must be purely additive.
@@ -513,7 +518,7 @@ cycles):
 
 - The stop rule fired 11 times, each on a phone Life360 still called `inTransit:true` (a parked phone, or one
   flagged on a single fix at speed 0), once the etag had been unchanged for the whole window (the next 20 s poll
-  after it). The fast chain ended on the next poll while Life360's `inTransit` stayed true.
+  after it). Fast polling ended on the next poll while Life360's `inTransit` stayed true.
 - Every other stop was cleared by Life360 itself first; the rule was not needed.
 - No false stop during real driving in cars. The longest gap between fixes while driving was 60 to 64 s.
 - Life360 sometimes sets `inTransit:true` again for a few minutes at speed 0 and the same position, then clears

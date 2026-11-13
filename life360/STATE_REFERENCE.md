@@ -69,8 +69,7 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 | Variable               | Type    | Set by                                    | Notes                                                                                                                                                            |
 | ---------------------- | ------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lastSuccessMs`        | Long    | `markFetchSuccess` (at most once a minute) | Watchdog input; triggers warn if stale > `max(pollFreq×10, 10min)`. Not cleared by `resetWatchdog()`, so Step 5 keeps the last real success |
-| `inTransit-<memberId>` | Boolean | `notifyChildDevice` (echo from driver)    | Per-member moving flag: the driver's return value (the published `inTransit`; key name kept for compatibility; identity-scoped; survives re-auth). Used by `ensureFastChain` to decide whether to seed a fast-poll chain for this member            |
-| `fastChain-<memberId>` | Boolean | `ensureFastChain()`                       | True while a per-member `runIn` fast-poll chain is active. Dropped by `scheduleSlowTimer()` (which calls `unschedule()`) and cleared when a chain ends naturally |
+| `inTransit-<memberId>` | Boolean | `notifyChildDevice` (echo from driver)    | Per-member moving flag: the driver's return value (the published `inTransit`; key name kept for compatibility; identity-scoped; survives re-auth). Used by the fast timer to decide who to poll            |
 
 ### Membership / discovery polling
 
@@ -80,9 +79,11 @@ Persisted via `state.<name>`. Reset on Hubitat reboot only if explicitly cleared
 | `lastMembersPollMs` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleSlowTimer` | Throttles the periodic roster refresh to once per `max(pollFreq, 900)` s (~5 min while no roster). Stamped by `updated()`, cleared by `initialize()` |
 | `etagChangedMs-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleMemberLocationResponse` | When this member's etag last changed; drives the stale-etag stop (APP_SPEC §13). Removed by `cleanupMemberState()` and `uninstalled()`; lost on reboot, which only restarts the clock |
 | `noEtagWarnMs` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleMemberLocationResponse` | When the "no l360-etag header" warning last fired (one per `MEMBERS_REFRESH_SECS`, app-wide). Cleared by `uninstalled()` |
+| `fastTimerOn` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `ensureFastTimer()` | Set while the shared fast timer is scheduled; cleared by `stopFastTimer()` and `scheduleSlowTimer()`. Empty after a reboot; the next slow tick re-arms it if anyone is in transit |
+| `inTransit-<memberId>` (memory) | Long | MEMORY-ONLY (`RUNTIME` map) — `notifyChildDevice` | 1/0 copy of the driver's return, written every update; `isMemberInTransit()` reads it before `state` so a reply whose state isn't saved yet is seen. Removed by `cleanupMemberState()` |
 | `forceUpdate-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `forceNextDeviceUpdate()` (Done, refresh, Fetch Locations/Places) | When the force was set; the first request sent after it reaches the device even if unchanged, then it is cleared. Removed by `cleanupMemberState()` and `uninstalled()` |
 | `locTs-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleMemberLocationResponse` | Last location timestamp Life360 sent; used only by the debug `FALSE POSITIVE` line. Removed by `cleanupMemberState()` and `uninstalled()` |
-| `lastFetch-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `fastPollMember` | When the fast chain last polled this member; a slow tick skips a fast-chain member polled within two fast intervals. Removed by `cleanupMemberState()` and `uninstalled()` |
+| `lastFetch-<memberId>` | Long | MEMORY-ONLY (`RUNTIME` map), not in `state` — `handleFastTimer` | When the fast timer last polled this member; a slow tick skips a member the fast timer polled within two fast intervals. Removed by `cleanupMemberState()` and `uninstalled()` |
 
 ### UI one-shot status (button results)
 
@@ -111,7 +112,7 @@ Each `*Status` holds an HTML result string; the paired `*StatusPending` flag sur
 | Handler                   | Schedule                                                           | Set by                                   | Purpose                                                                                                                                                                                                                                                                    |
 | ------------------------- | ------------------------------------------------------------------ | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `handleSlowTimer`         | `0/<baseSecs> * * * * ? *` (sub-minute) or `0 */<min> * * * ? *`   | `scheduleSlowTimer()`                    | Each tick: watchdog, roster refresh (APP_SPEC §4.2), then `fetchLocations(true)` (or the `/users/me` probe when `tokenLikelyExpired`) |
-| `fastPollMember`          | one-shot `runIn(<dynamicPollFreq>s)`, self-rescheduling per member | `ensureFastChain()` / `fastPollMember()` | Per-member fast-poll chain for in-transit members (APP_SPEC §4.3); ends when the member stops moving, is deselected, or `scheduleSlowTimer()` is called                                                               |
+| `handleFastTimer`         | `0/<dynamicPollFreq> * * * * ? *` while anyone is in transit       | `ensureFastTimer()`                      | One shared fast poll of every member in transit (APP_SPEC §4.3); unschedules itself when nobody is moving, or on `scheduleSlowTimer()` |
 | `sendTokenExpiryReminder` | one-shot `runIn(<notifyRepeatHours>h)`, self-rescheduling          | `scheduleTokenExpiryReminder()`          | Repeats the token-expiry notification while `tokenLikelyExpired` stays true; chain stops once the token is refreshed or `notifyRepeatHours = never`                                                                                                                        |
 
 `baseSecs` = `pollFreq`, forced to 300 when `tokenLikelyExpired`.
@@ -239,7 +240,7 @@ These are written by the "Life360 Tracker" external app via the driver's `sendHi
 
 | Command            | Args   | Purpose                                                                                                                                             |
 | ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `refresh`          | —      | Calls `parent.refresh()` → an immediate `fetchLocations()`; unchanged data is still skipped (the schedule and any fast-poll chains are left running)                                                          |
+| `refresh`          | —      | Calls `parent.refresh()` → an immediate `fetchLocations()`; unchanged data is still skipped (the schedule and the fast timer are left running)                                                          |
 | `arrived`          | —      | Manually flip `presence` to `present`                                                                                                               |
 | `departed`         | —      | Manually flip `presence` to `not present`                                                                                                           |
 | `sendHistory`      | string | External integration — prepends a line to `state.list1` → `bpt-history` tile                                                                        |

@@ -5,7 +5,8 @@
 **Fewer requests while driving, a watchdog fix, and `inTransit` is the one motion value.**
 
 - **Watchdog:** Done, a reboot or a token recovery no longer wipes the last-success time, so an outage that continues past them still warns, and Step 5 keeps showing the last real success.
-- **Fewer requests while driving:** a slow tick skips a member the fast chain polled within the last two fast intervals.
+- **Fewer requests while driving:** a slow tick skips a member the fast timer polled within the last two fast intervals.
+- **Lighter fast polling:** one shared timer polls everyone in transit, instead of a per-member chain that rescheduled itself every tick (about 16% of the app's hub time, per Timing Stats).
 - **`isMoving` is removed; everything follows `inTransit`** (tile, `acceleration`, start/stop and "moving @" log lines, map page). Rules using `isMoving` should switch to `inTransit`.
 - **New Early Parked Detection setting** (off by default; set it in the app, and override it per member device: Use app setting / On / Off). Life360 sometimes keeps saying a phone is moving after it has parked, or briefly says it is moving again while it sits still. With this on:
   - A phone Life360 still calls moving, that has sent nothing new for 4 minutes and was last going under 3.5 mph, shows as **not moving**.
